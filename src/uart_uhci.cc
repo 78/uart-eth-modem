@@ -314,7 +314,6 @@ esp_err_t UartUhci::StartReceive() {
 
         mount_configs[mounted].buffer = buf->data;
         mount_configs[mounted].length = buf->capacity;
-        mount_configs[mounted].flags.mark_final = false;  // Not final, circular
         
         // Track which buffer is mounted at this DMA node
         rx_mounted_idx_[mounted] = idx;
@@ -498,7 +497,6 @@ bool UartUhci::HandleGdmaRxDone(bool is_eof) {
         gdma_buffer_mount_config_t mount = {};
         mount.buffer = new_buf->data;
         mount.length = new_buf->capacity;
-        mount.flags.mark_final = false;
         
         // Mount at the position of the completed buffer
         gdma_link_mount_buffers(rx_dma_link_, node_idx, &mount, 1, nullptr);
