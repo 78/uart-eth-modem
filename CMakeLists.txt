@@ -11,4 +11,5 @@ idf_component_register(
         esp_driver_uart
         esp_netif
         iot_eth
+        esp_timer
 )
