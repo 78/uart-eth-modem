@@ -1513,15 +1513,15 @@ esp_err_t UartEthModem::RunInitSequence() {
         }
     }
 
-    ESP_LOGI(kTag, "Querying modem info...");
-    QueryModemInfo();
-
     ESP_LOGI(kTag, "Checking SIM card...");
     if (!CheckSimCard()) {
         ESP_LOGE(kTag, "SIM card not ready");
         SetNetworkEvent(UartEthModemEvent::ErrorNoSim);
         return ESP_ERR_INVALID_STATE;
     }
+
+    ESP_LOGI(kTag, "Querying modem info...");
+    QueryModemInfo();
 
     ESP_LOGI(kTag, "Waiting for network registration...");
     SetNetworkEvent(UartEthModemEvent::Connecting);
@@ -1640,7 +1640,7 @@ void UartEthModem::QueryModemInfo() {
     std::string resp;
 
     // Get IMEI using sscanf, consistent with C implementation
-    if (SendAt("AT+CGSN=1", resp, 300) == ESP_OK) {
+    if (SendAt("AT+CGSN=1", resp, 1000) == ESP_OK) {
         char imei[16] = {0};
         if (sscanf(resp.c_str(), "\r\n+CGSN: \"%15s", imei) == 1) {
             imei_ = imei;
@@ -1648,7 +1648,7 @@ void UartEthModem::QueryModemInfo() {
     }
 
     // Get ICCID using sscanf, consistent with C implementation
-    if (SendAt("AT+ECICCID", resp, 300) == ESP_OK) {
+    if (SendAt("AT+ECICCID", resp, 1000) == ESP_OK) {
         char iccid[21] = {0};
         if (sscanf(resp.c_str(), "\r\n+ECICCID: %20s", iccid) == 1) {
             iccid_ = iccid;
@@ -1656,7 +1656,7 @@ void UartEthModem::QueryModemInfo() {
     }
 
     // Get module revision using sscanf, consistent with C implementation
-    if (SendAt("AT+CGMR", resp, 300) == ESP_OK) {
+    if (SendAt("AT+CGMR", resp, 1000) == ESP_OK) {
         char revision[128] = {0};
         if (resp.find("+CGMR:") != std::string::npos) {
             // Format: "\r\n+CGMR: \r\n<version>\r\n"
