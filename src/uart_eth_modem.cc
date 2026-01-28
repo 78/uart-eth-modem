@@ -583,12 +583,23 @@ esp_err_t UartEthModem::InitIotEth() {
 }
 
 void UartEthModem::DeinitUart() {
-    // UHCI mode: UART driver is not installed, nothing to delete
+    // UHCI mode: UART driver is not installed, just disconnect pins and reset GPIO
+    // Disconnect UART pins (set to UART_PIN_NO_CHANGE disconnects the signal)
+    uart_set_pin(config_.uart_num, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // Reset GPIO pins to default state (input, no pull) to save power
+    gpio_reset_pin(config_.tx_pin);
+    gpio_reset_pin(config_.rx_pin);
 }
 
 void UartEthModem::DeinitGpio() {
     gpio_wakeup_disable(config_.srdy_pin);
     gpio_isr_handler_remove(config_.srdy_pin);
+    // Re-enable sleep select (was disabled in InitGpio for MRDY)
+    gpio_sleep_sel_en(config_.mrdy_pin);
+    // Reset GPIO pins to default state (input, no pull) to save power
+    gpio_reset_pin(config_.mrdy_pin);
+    gpio_reset_pin(config_.srdy_pin);
 }
 
 void UartEthModem::DeinitIotEth() {
