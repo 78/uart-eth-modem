@@ -83,14 +83,15 @@ UartEthModem::~UartEthModem() {
     }
 }
 
-esp_err_t UartEthModem::Start() {
-    ESP_LOGI(kTag, "Starting UartEthModem...");
+esp_err_t UartEthModem::Start(bool flight_mode) {
+    ESP_LOGI(kTag, "Starting UartEthModem%s...", flight_mode ? " (flight mode)" : "");
 
     if (initialized_.load()) {
         ESP_LOGW(kTag, "Already started");
         return ESP_ERR_INVALID_STATE;
     }
 
+    flight_mode_ = flight_mode;
     stop_flag_ = false;
     handshake_done_ = false;
     initializing_ = true;
@@ -219,7 +220,9 @@ esp_err_t UartEthModem::Start() {
 }
 
 esp_err_t UartEthModem::Stop() {
-    if (!initialized_.load() && !initializing_.load()) {
+    // Check if there's anything to stop: event_queue_ is created in Start()
+    // and destroyed in CleanupResources(). If it exists, tasks may be running.
+    if (!event_queue_) {
         return ESP_OK;
     }
 
@@ -433,6 +436,7 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::Connecting: return "Connecting";
         case UartEthModemEvent::Connected: return "Connected";
         case UartEthModemEvent::Disconnected: return "Disconnected";
+        case UartEthModemEvent::InFlightMode: return "InFlightMode";
         case UartEthModemEvent::ErrorNoSim: return "ErrorNoSim";
         case UartEthModemEvent::ErrorRegistrationDenied: return "ErrorRegistrationDenied";
         case UartEthModemEvent::ErrorInitFailed: return "ErrorInitFailed";
@@ -617,6 +621,10 @@ void UartEthModem::DeinitIotEth() {
         glue_ = nullptr;
     }
     if (eth_netif_) {
+        // Stop DHCP client first to prevent use-after-free in dhcp_fine_tmr
+        // The DHCP timer runs periodically and accesses netif's DHCP data;
+        // destroying netif without stopping DHCP causes crash.
+        esp_netif_dhcpc_stop(eth_netif_);
         esp_netif_destroy(eth_netif_);
         eth_netif_ = nullptr;
     }
@@ -1185,27 +1193,32 @@ void UartEthModem::InitTaskRun() {
         goto exit;
     }
 
-    // Run initialization sequence
-    if (RunInitSequence() != ESP_OK) {
-        ESP_LOGE(kTag, "Initialization sequence failed");
-        stop_flag_ = true;
-        initializing_ = false;
-        xEventGroupSetBits(event_group_, kEventStop);
-        goto exit;
-    }
+    // Run initialization sequence based on mode
+    {
+        esp_err_t init_ret = flight_mode_ ? RunFlightModeInitSequence() : RunNormalModeInitSequence();
+        if (init_ret != ESP_OK) {
+            ESP_LOGE(kTag, "Initialization sequence failed");
+            stop_flag_ = true;
+            initializing_ = false;
+            xEventGroupSetBits(event_group_, kEventStop);
+            goto exit;
+        }
 
-    // Initialize iot_eth
-    if (InitIotEth() != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to initialize iot_eth");
-        stop_flag_ = true;
-        initializing_ = false;
-        xEventGroupSetBits(event_group_, kEventStop);
-        goto exit;
-    }
+        // Initialize iot_eth (skip in flight mode - no network needed)
+        if (!flight_mode_) {
+            if (InitIotEth() != ESP_OK) {
+                ESP_LOGE(kTag, "Failed to initialize iot_eth");
+                stop_flag_ = true;
+                initializing_ = false;
+                xEventGroupSetBits(event_group_, kEventStop);
+                goto exit;
+            }
+        }
 
-    ESP_LOGD(kTag, "Initialization complete");
-    initializing_ = false;
-    xEventGroupSetBits(event_group_, kEventInitDone);
+        ESP_LOGD(kTag, "Initialization complete");
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventInitDone);
+    }
 
 exit:
     ESP_LOGD(kTag, "Init task exiting");
@@ -1471,7 +1484,7 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
     }
 }
 
-esp_err_t UartEthModem::RunInitSequence() {
+esp_err_t UartEthModem::RunFlightModeInitSequence() {
     std::string resp;
     esp_err_t ret;
 
@@ -1484,13 +1497,52 @@ esp_err_t UartEthModem::RunInitSequence() {
         return ret;
     }
 
-    ret = SendAt("AT+CFUN=1", resp, 3000);
+    // Enter flight mode (CFUN=4)
+    ret = SendAt("AT+CFUN=4", resp, 3000);
     if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to send AT+CFUN=1");
+        ESP_LOGE(kTag, "Failed to enter flight mode");
         SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
         return ret;
     }
 
+    ESP_LOGI(kTag, "Checking SIM card...");
+    if (!CheckSimCard()) {
+        ESP_LOGE(kTag, "SIM card not ready");
+        SetNetworkEvent(UartEthModemEvent::ErrorNoSim);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(kTag, "Querying modem info...");
+    QueryModemInfo();
+
+    ESP_LOGI(kTag, "Flight mode initialization complete");
+    initialized_ = true;
+    SetNetworkEvent(UartEthModemEvent::InFlightMode);
+    return ESP_OK;
+}
+
+esp_err_t UartEthModem::RunNormalModeInitSequence() {
+    std::string resp;
+    esp_err_t ret;
+
+    // Step 1: AT test
+    ESP_LOGI(kTag, "Detecting modem...");
+    ret = SendAtWithRetry("AT", resp, 500, 20);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Modem not detected");
+        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+        return ret;
+    }
+
+    // Enter full functionality mode (CFUN=1)
+    ret = SendAt("AT+CFUN=1", resp, 3000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Failed to enter full functionality mode");
+        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+        return ret;
+    }
+
+    // Check and configure network settings
     ESP_LOGI(kTag, "Checking network configuration...");
     ret = SendAt("AT+ECNETCFG?", resp, 1000);
     if (ret != ESP_OK || resp.find("+ECNETCFG: \"nat\",1") == std::string::npos) {
@@ -1502,7 +1554,6 @@ esp_err_t UartEthModem::RunInitSequence() {
         SendAtWithRetry("AT&W", resp, 300, 3);
         
         // Reset after configuration
-        // Clear network status changed bit before reset
         xEventGroupClearBits(event_group_, kEventNetworkEventChanged);
         SendAt("AT+ECRST", resp, 500);
         auto bits = xEventGroupWaitBits(event_group_, kEventNetworkEventChanged | kEventStop, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
@@ -1551,7 +1602,6 @@ esp_err_t UartEthModem::RunInitSequence() {
     }
 
     ESP_LOGI(kTag, "Starting network device...");
-    // ECNETDEVCTL may take several seconds to start network device
     ret = SendAt("AT+ECNETDEVCTL=2,1,1", resp, 5000);
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Failed to start network device");
@@ -1589,7 +1639,6 @@ esp_err_t UartEthModem::RunInitSequence() {
         return ret;
     }
 
-    // Network ready is set in HandleEthFrame when handshake ACK is received
     ESP_LOGI(kTag, "Modem initialization complete!");
     return ESP_OK;
 }
