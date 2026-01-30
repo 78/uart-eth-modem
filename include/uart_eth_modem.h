@@ -319,7 +319,6 @@ private:
     void SetMrdy(MrdyLevel level);
     bool IsSrdyLow();
     void SendAckPulse();
-    bool WaitForSrdyAck(int64_t timeout_us);
     void ConfigureSrdyInterrupt(bool for_wakeup);
     static void IRAM_ATTR SrdyIsrHandler(void* arg);
 

@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_rom_sys.h"
+#include "hal/gpio_ll.h"
 
 // Static member definitions
 constexpr uint8_t UartEthModem::kHandshakeRequest[];
@@ -1768,15 +1769,16 @@ void UartEthModem::ConfigureSrdyInterrupt(bool for_wakeup) {
 }
 
 // ISR handler for SRDY pin changes
+// NOTE: Must use gpio_ll_* functions here for IRAM safety during Flash writes
 void IRAM_ATTR UartEthModem::SrdyIsrHandler(void* arg) {
     auto* self = static_cast<UartEthModem*>(arg);
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    // Disable interrupt to avoid repeated triggers
-    gpio_intr_disable(self->config_.srdy_pin);
+    // Disable interrupt to avoid repeated triggers (IRAM-safe)
+    gpio_ll_intr_disable(&GPIO, self->config_.srdy_pin);
 
-    // Determine event type based on current SRDY level
-    int level = gpio_get_level(self->config_.srdy_pin);
+    // Determine event type based on current SRDY level (IRAM-safe)
+    int level = gpio_ll_get_level(&GPIO, self->config_.srdy_pin);
 
     // Send event to queue for state machine processing
     Event event = {
