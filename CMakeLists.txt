@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "src/uart_eth_modem.cc"
-        "src/uart_uhci.cc"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -11,4 +10,5 @@ idf_component_register(
         esp_driver_uart
         esp_netif
         iot_eth
+        uart-uhci
 )

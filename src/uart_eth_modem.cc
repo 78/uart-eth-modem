@@ -151,8 +151,6 @@ esp_err_t UartEthModem::Start(bool flight_mode) {
     // Initialize UART UHCI DMA controller with buffer pool
     UartUhci::Config uhci_cfg = {
         .uart_port = config_.uart_num,
-        .tx_queue_depth = 1,  // Only 1 TX at a time since we wait for ACK
-        .max_tx_size = kMaxFrameSize,
         .dma_burst_size = 32,
         .rx_pool = {
             .buffer_count = kRxBufferCount,
