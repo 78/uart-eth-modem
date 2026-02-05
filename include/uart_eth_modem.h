@@ -99,6 +99,8 @@ public:
         gpio_num_t rx_pin = GPIO_NUM_NC;
         gpio_num_t mrdy_pin = GPIO_NUM_NC;   // Master Ready (DTR, low=busy)
         gpio_num_t srdy_pin = GPIO_NUM_NC;   // Slave Ready (RI, low=busy)
+        size_t rx_buffer_count = 4;          // Number of DMA RX buffers
+        size_t rx_buffer_size = 1600;        // Size of each DMA RX buffer
     };
 
     // Callback types
@@ -352,8 +354,6 @@ private:
     // Frame reassembly buffer for incomplete frames
     // 用于不完整帧的重组缓冲区
     static constexpr size_t kMaxFrameSize = 1600;
-    static constexpr size_t kRxBufferCount = 4;
-    static constexpr size_t kRxBufferSize = 1600;
     uint8_t* reassembly_buffer_ = nullptr;
     size_t reassembly_size_ = 0;
     size_t reassembly_expected_ = 0;  // Expected total frame size (header + payload)

@@ -153,8 +153,8 @@ esp_err_t UartEthModem::Start(bool flight_mode) {
         .uart_port = config_.uart_num,
         .dma_burst_size = 32,
         .rx_pool = {
-            .buffer_count = kRxBufferCount,
-            .buffer_size = kRxBufferSize,
+            .buffer_count = config_.rx_buffer_count,
+            .buffer_size = config_.rx_buffer_size,
         },
     };
 
@@ -940,7 +940,7 @@ void UartEthModem::HandleRxData(UartUhci::RxBuffer* buffer) {
                 offset += frame_size;
                 
                 // Send ACK after processing complete frame
-        SendAckPulse();
+                SendAckPulse();
             } else {
                 // Partial frame, copy to reassembly buffer
                 memcpy(reassembly_buffer_, data + offset, remaining);
