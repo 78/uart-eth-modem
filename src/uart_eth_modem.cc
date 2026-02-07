@@ -6,11 +6,14 @@
 #include <cstdio>
 #include <cstring>
 
-#include "esp_check.h"
-#include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_rom_sys.h"
-#include "hal/gpio_ll.h"
+#include <esp_check.h>
+#include <esp_log.h>
+#include <esp_mac.h>
+#include <esp_rom_sys.h>
+#include <hal/gpio_ll.h>
+#include <lwip/dns.h>
+#include <lwip/tcpip.h>
+
 
 // Static member definitions
 constexpr uint8_t UartEthModem::kHandshakeRequest[];
@@ -581,6 +584,11 @@ esp_err_t UartEthModem::InitIotEth() {
         int link_status = 0;  // IOT_ETH_LINK_UP
         mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LINK, &link_status);
     }
+
+    // Clear DNS cache
+    tcpip_callback([](void* arg) -> void {
+        dns_clear_cache();
+    }, nullptr);
 
     return ESP_OK;
 }
@@ -1555,20 +1563,21 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         // Reset after configuration
         xEventGroupClearBits(event_group_, kEventNetworkEventChanged);
         SendAt("AT+ECRST", resp, 500);
-        auto bits = xEventGroupWaitBits(event_group_, kEventNetworkEventChanged | kEventStop, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
-        if (bits & kEventStop) {
-            ESP_LOGW(kTag, "Stop event received in ResetModem");
-            return ESP_ERR_INVALID_STATE;
-        } else if (bits & kEventNetworkEventChanged) {
-            ESP_LOGI(kTag, "Modem reset completed");
-        } else {
-            ESP_LOGE(kTag, "Modem reset timed out");
-            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
-            return ESP_ERR_TIMEOUT;
-        }
+
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        
+        // Wait for modem to respond
         ret = SendAtWithRetry("AT", resp, 500, 20);
         if (ret != ESP_OK) {
             ESP_LOGE(kTag, "Modem not responding after reset");
+            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+            return ret;
+        }
+
+        // Enter full functionality mode (CFUN=1)
+        ret = SendAt("AT+CFUN=1", resp, 3000);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "Failed to enter full functionality mode");
             SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
             return ret;
         }
