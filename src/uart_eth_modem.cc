@@ -6,11 +6,15 @@
 #include <cstdio>
 #include <cstring>
 
-#include "esp_check.h"
-#include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_rom_sys.h"
-#include "esp_timer.h"
+#include <esp_check.h>
+#include <esp_log.h>
+#include <esp_mac.h>
+#include <esp_timer.h>
+#include <esp_rom_sys.h>
+#include <hal/gpio_ll.h>
+#include <lwip/dns.h>
+#include <lwip/tcpip.h>
+
 
 // Static member definitions
 constexpr uint8_t UartEthModem::kHandshakeRequest[];
@@ -84,14 +88,15 @@ UartEthModem::~UartEthModem() {
     }
 }
 
-esp_err_t UartEthModem::Start() {
-    ESP_LOGI(kTag, "Starting UartEthModem...");
+esp_err_t UartEthModem::Start(bool flight_mode) {
+    ESP_LOGI(kTag, "Starting UartEthModem%s...", flight_mode ? " (flight mode)" : "");
 
     if (initialized_.load()) {
         ESP_LOGW(kTag, "Already started");
         return ESP_ERR_INVALID_STATE;
     }
 
+    flight_mode_ = flight_mode;
     stop_flag_ = false;
     handshake_done_ = false;
     initializing_ = true;
@@ -150,12 +155,10 @@ esp_err_t UartEthModem::Start() {
     // Initialize UART UHCI DMA controller with buffer pool
     UartUhci::Config uhci_cfg = {
         .uart_port = config_.uart_num,
-        .tx_queue_depth = 1,  // Only 1 TX at a time since we wait for ACK
-        .max_tx_size = kMaxFrameSize,
         .dma_burst_size = 32,
         .rx_pool = {
-            .buffer_count = kRxBufferCount,
-            .buffer_size = kRxBufferSize,
+            .buffer_count = config_.rx_buffer_count,
+            .buffer_size = config_.rx_buffer_size,
         },
     };
 
@@ -220,7 +223,9 @@ esp_err_t UartEthModem::Start() {
 }
 
 esp_err_t UartEthModem::Stop() {
-    if (!initialized_.load() && !initializing_.load()) {
+    // Check if there's anything to stop: event_queue_ is created in Start()
+    // and destroyed in CleanupResources(). If it exists, tasks may be running.
+    if (!event_queue_) {
         return ESP_OK;
     }
 
@@ -434,6 +439,7 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::Connecting: return "Connecting";
         case UartEthModemEvent::Connected: return "Connected";
         case UartEthModemEvent::Disconnected: return "Disconnected";
+        case UartEthModemEvent::InFlightMode: return "InFlightMode";
         case UartEthModemEvent::ErrorNoSim: return "ErrorNoSim";
         case UartEthModemEvent::ErrorRegistrationDenied: return "ErrorRegistrationDenied";
         case UartEthModemEvent::ErrorInitFailed: return "ErrorInitFailed";
@@ -580,16 +586,32 @@ esp_err_t UartEthModem::InitIotEth() {
         mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LINK, &link_status);
     }
 
+    // Clear DNS cache
+    tcpip_callback([](void* arg) -> void {
+        dns_clear_cache();
+    }, nullptr);
+
     return ESP_OK;
 }
 
 void UartEthModem::DeinitUart() {
-    // UHCI mode: UART driver is not installed, nothing to delete
+    // UHCI mode: UART driver is not installed, just disconnect pins and reset GPIO
+    // Disconnect UART pins (set to UART_PIN_NO_CHANGE disconnects the signal)
+    uart_set_pin(config_.uart_num, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // Reset GPIO pins to default state (input, no pull) to save power
+    gpio_reset_pin(config_.tx_pin);
+    gpio_reset_pin(config_.rx_pin);
 }
 
 void UartEthModem::DeinitGpio() {
     gpio_wakeup_disable(config_.srdy_pin);
     gpio_isr_handler_remove(config_.srdy_pin);
+    // Re-enable sleep select (was disabled in InitGpio for MRDY)
+    gpio_sleep_sel_en(config_.mrdy_pin);
+    // Reset GPIO pins to default state (input, no pull) to save power
+    gpio_reset_pin(config_.mrdy_pin);
+    gpio_reset_pin(config_.srdy_pin);
 }
 
 void UartEthModem::DeinitIotEth() {
@@ -607,6 +629,10 @@ void UartEthModem::DeinitIotEth() {
         glue_ = nullptr;
     }
     if (eth_netif_) {
+        // Stop DHCP client first to prevent use-after-free in dhcp_fine_tmr
+        // The DHCP timer runs periodically and accesses netif's DHCP data;
+        // destroying netif without stopping DHCP causes crash.
+        esp_netif_dhcpc_stop(eth_netif_);
         esp_netif_destroy(eth_netif_);
         eth_netif_ = nullptr;
     }
@@ -923,7 +949,7 @@ void UartEthModem::HandleRxData(UartUhci::RxBuffer* buffer) {
                 offset += frame_size;
                 
                 // Send ACK after processing complete frame
-        SendAckPulse();
+                SendAckPulse();
             } else {
                 // Partial frame, copy to reassembly buffer
                 memcpy(reassembly_buffer_, data + offset, remaining);
@@ -1175,27 +1201,32 @@ void UartEthModem::InitTaskRun() {
         goto exit;
     }
 
-    // Run initialization sequence
-    if (RunInitSequence() != ESP_OK) {
-        ESP_LOGE(kTag, "Initialization sequence failed");
-        stop_flag_ = true;
-        initializing_ = false;
-        xEventGroupSetBits(event_group_, kEventStop);
-        goto exit;
-    }
+    // Run initialization sequence based on mode
+    {
+        esp_err_t init_ret = flight_mode_ ? RunFlightModeInitSequence() : RunNormalModeInitSequence();
+        if (init_ret != ESP_OK) {
+            ESP_LOGE(kTag, "Initialization sequence failed");
+            stop_flag_ = true;
+            initializing_ = false;
+            xEventGroupSetBits(event_group_, kEventStop);
+            goto exit;
+        }
 
-    // Initialize iot_eth
-    if (InitIotEth() != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to initialize iot_eth");
-        stop_flag_ = true;
-        initializing_ = false;
-        xEventGroupSetBits(event_group_, kEventStop);
-        goto exit;
-    }
+        // Initialize iot_eth (skip in flight mode - no network needed)
+        if (!flight_mode_) {
+            if (InitIotEth() != ESP_OK) {
+                ESP_LOGE(kTag, "Failed to initialize iot_eth");
+                stop_flag_ = true;
+                initializing_ = false;
+                xEventGroupSetBits(event_group_, kEventStop);
+                goto exit;
+            }
+        }
 
-    ESP_LOGD(kTag, "Initialization complete");
-    initializing_ = false;
-    xEventGroupSetBits(event_group_, kEventInitDone);
+        ESP_LOGD(kTag, "Initialization complete");
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventInitDone);
+    }
 
 exit:
     ESP_LOGD(kTag, "Init task exiting");
@@ -1461,7 +1492,7 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
     }
 }
 
-esp_err_t UartEthModem::RunInitSequence() {
+esp_err_t UartEthModem::RunFlightModeInitSequence() {
     std::string resp;
     esp_err_t ret;
 
@@ -1474,13 +1505,52 @@ esp_err_t UartEthModem::RunInitSequence() {
         return ret;
     }
 
-    ret = SendAt("AT+CFUN=1", resp, 3000);
+    // Enter flight mode (CFUN=4)
+    ret = SendAt("AT+CFUN=4", resp, 3000);
     if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to send AT+CFUN=1");
+        ESP_LOGE(kTag, "Failed to enter flight mode");
         SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
         return ret;
     }
 
+    ESP_LOGI(kTag, "Checking SIM card...");
+    if (!CheckSimCard()) {
+        ESP_LOGE(kTag, "SIM card not ready");
+        SetNetworkEvent(UartEthModemEvent::ErrorNoSim);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(kTag, "Querying modem info...");
+    QueryModemInfo();
+
+    ESP_LOGI(kTag, "Flight mode initialization complete");
+    initialized_ = true;
+    SetNetworkEvent(UartEthModemEvent::InFlightMode);
+    return ESP_OK;
+}
+
+esp_err_t UartEthModem::RunNormalModeInitSequence() {
+    std::string resp;
+    esp_err_t ret;
+
+    // Step 1: AT test
+    ESP_LOGI(kTag, "Detecting modem...");
+    ret = SendAtWithRetry("AT", resp, 500, 20);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Modem not detected");
+        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+        return ret;
+    }
+
+    // Enter full functionality mode (CFUN=1)
+    ret = SendAt("AT+CFUN=1", resp, 3000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Failed to enter full functionality mode");
+        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+        return ret;
+    }
+
+    // Check and configure network settings
     ESP_LOGI(kTag, "Checking network configuration...");
     ret = SendAt("AT+ECNETCFG?", resp, 1000);
     if (ret != ESP_OK || resp.find("+ECNETCFG: \"nat\",1") == std::string::npos) {
@@ -1492,30 +1562,27 @@ esp_err_t UartEthModem::RunInitSequence() {
         SendAtWithRetry("AT&W", resp, 300, 3);
         
         // Reset after configuration
-        // Clear network status changed bit before reset
         xEventGroupClearBits(event_group_, kEventNetworkEventChanged);
         SendAt("AT+ECRST", resp, 500);
-        auto bits = xEventGroupWaitBits(event_group_, kEventNetworkEventChanged | kEventStop, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
-        if (bits & kEventStop) {
-            ESP_LOGW(kTag, "Stop event received in ResetModem");
-            return ESP_ERR_INVALID_STATE;
-        } else if (bits & kEventNetworkEventChanged) {
-            ESP_LOGI(kTag, "Modem reset completed");
-        } else {
-            ESP_LOGE(kTag, "Modem reset timed out");
-            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
-            return ESP_ERR_TIMEOUT;
-        }
+
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        
+        // Wait for modem to respond
         ret = SendAtWithRetry("AT", resp, 500, 20);
         if (ret != ESP_OK) {
             ESP_LOGE(kTag, "Modem not responding after reset");
             SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
             return ret;
         }
-    }
 
-    ESP_LOGI(kTag, "Querying modem info...");
-    QueryModemInfo();
+        // Enter full functionality mode (CFUN=1)
+        ret = SendAt("AT+CFUN=1", resp, 3000);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "Failed to enter full functionality mode");
+            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+            return ret;
+        }
+    }
 
     ESP_LOGI(kTag, "Checking SIM card...");
     if (!CheckSimCard()) {
@@ -1523,6 +1590,9 @@ esp_err_t UartEthModem::RunInitSequence() {
         SetNetworkEvent(UartEthModemEvent::ErrorNoSim);
         return ESP_ERR_INVALID_STATE;
     }
+
+    ESP_LOGI(kTag, "Querying modem info...");
+    QueryModemInfo();
 
     ESP_LOGI(kTag, "Waiting for network registration...");
     SetNetworkEvent(UartEthModemEvent::Connecting);
@@ -1541,7 +1611,6 @@ esp_err_t UartEthModem::RunInitSequence() {
     }
 
     ESP_LOGI(kTag, "Starting network device...");
-    // ECNETDEVCTL may take several seconds to start network device
     ret = SendAt("AT+ECNETDEVCTL=2,1,1", resp, 5000);
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Failed to start network device");
@@ -1579,7 +1648,6 @@ esp_err_t UartEthModem::RunInitSequence() {
         return ret;
     }
 
-    // Network ready is set in HandleEthFrame when handshake ACK is received
     ESP_LOGI(kTag, "Modem initialization complete!");
     return ESP_OK;
 }
@@ -1641,7 +1709,7 @@ void UartEthModem::QueryModemInfo() {
     std::string resp;
 
     // Get IMEI using sscanf, consistent with C implementation
-    if (SendAt("AT+CGSN=1", resp, 300) == ESP_OK) {
+    if (SendAt("AT+CGSN=1", resp, 1000) == ESP_OK) {
         char imei[16] = {0};
         if (sscanf(resp.c_str(), "\r\n+CGSN: \"%15s", imei) == 1) {
             imei_ = imei;
@@ -1649,7 +1717,7 @@ void UartEthModem::QueryModemInfo() {
     }
 
     // Get ICCID using sscanf, consistent with C implementation
-    if (SendAt("AT+ECICCID", resp, 300) == ESP_OK) {
+    if (SendAt("AT+ECICCID", resp, 1000) == ESP_OK) {
         char iccid[21] = {0};
         if (sscanf(resp.c_str(), "\r\n+ECICCID: %20s", iccid) == 1) {
             iccid_ = iccid;
@@ -1657,7 +1725,7 @@ void UartEthModem::QueryModemInfo() {
     }
 
     // Get module revision using sscanf, consistent with C implementation
-    if (SendAt("AT+CGMR", resp, 300) == ESP_OK) {
+    if (SendAt("AT+CGMR", resp, 1000) == ESP_OK) {
         char revision[128] = {0};
         if (resp.find("+CGMR:") != std::string::npos) {
             // Format: "\r\n+CGMR: \r\n<version>\r\n"
@@ -1709,15 +1777,16 @@ void UartEthModem::ConfigureSrdyInterrupt(bool for_wakeup) {
 }
 
 // ISR handler for SRDY pin changes
+// NOTE: Must use gpio_ll_* functions here for IRAM safety during Flash writes
 void IRAM_ATTR UartEthModem::SrdyIsrHandler(void* arg) {
     auto* self = static_cast<UartEthModem*>(arg);
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    // Disable interrupt to avoid repeated triggers
-    gpio_intr_disable(self->config_.srdy_pin);
+    // Disable interrupt to avoid repeated triggers (IRAM-safe)
+    gpio_ll_intr_disable(&GPIO, self->config_.srdy_pin);
 
-    // Determine event type based on current SRDY level
-    int level = gpio_get_level(self->config_.srdy_pin);
+    // Determine event type based on current SRDY level (IRAM-safe)
+    int level = gpio_ll_get_level(&GPIO, self->config_.srdy_pin);
 
     // Send event to queue for state machine processing
     Event event = {
