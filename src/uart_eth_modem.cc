@@ -9,6 +9,7 @@
 #include <esp_check.h>
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_timer.h>
 #include <esp_rom_sys.h>
 #include <hal/gpio_ll.h>
 #include <lwip/dns.h>
