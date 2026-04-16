@@ -331,7 +331,8 @@ esp_err_t UartEthModem::SendAt(const std::string& cmd, std::string& response, ui
         return ESP_FAIL;
     }
 
-    return ESP_OK;
+    // Response contains neither OK nor ERROR (unexpected)
+    return ESP_FAIL;
 }
 
 void UartEthModem::SetNetworkEventCallback(UartEthModemEventCallback callback) {
@@ -1414,8 +1415,9 @@ void UartEthModem::HandleAtResponse(const char* data, size_t length) {
     // Parse URC or response
     ParseAtResponse(response);
 
-    // If waiting for AT response, signal completion
-    if (waiting_for_at_response_) {
+    // Only signal completion for final AT responses (OK/ERROR), not for URCs like ECRDY
+    if (waiting_for_at_response_ &&
+        (response.find("OK") != std::string::npos || response.find("ERROR") != std::string::npos)) {
         at_command_response_ = response;
         xEventGroupSetBits(event_group_, kEventAtResponse);
     }
