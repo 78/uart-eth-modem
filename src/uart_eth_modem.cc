@@ -1494,13 +1494,43 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
     }
 }
 
+esp_err_t UartEthModem::AtDetect() {
+    std::string resp;
+    esp_err_t ret;
+    int baud_rates[] = {2000000, 3000000};
+    ret = SendAtWithRetry("AT", resp, 500, 6);
+    if (ret == ESP_OK) {
+        return ESP_OK;
+    }
+    for (size_t i = 0; i < sizeof(baud_rates) / sizeof(baud_rates[0]); i++){
+        uart_set_baudrate(config_.uart_num, baud_rates[i]);
+        ESP_LOGI(kTag, "Trying baud rate: %d", baud_rates[i]);
+        ret = SendAtWithRetry("AT", resp, 500, 6);
+        if (ret == ESP_OK) {
+            if(baud_rates[i] != config_.baud_rate){
+                SendAt("AT+XJCFG=netPortBaudRate,"+ std::to_string(config_.baud_rate), resp);
+                SendAt("AT+ECRST", resp, 500);
+                uart_set_baudrate(config_.uart_num, config_.baud_rate);
+                vTaskDelay(pdMS_TO_TICKS(1500));
+                // Wait for modem to respond
+                ret = SendAtWithRetry("AT", resp, 500, 6);
+            }
+            return ret;
+        }
+    }
+    return ESP_FAIL;
+}
+
+
+
+
 esp_err_t UartEthModem::RunFlightModeInitSequence() {
     std::string resp;
     esp_err_t ret;
 
     // Step 1: AT test
     ESP_LOGI(kTag, "Detecting modem...");
-    ret = SendAtWithRetry("AT", resp, 500, 20);
+    ret = AtDetect();
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Modem not detected");
         SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
@@ -1537,7 +1567,7 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
 
     // Step 1: AT test
     ESP_LOGI(kTag, "Detecting modem...");
-    ret = SendAtWithRetry("AT", resp, 500, 20);
+    ret = AtDetect();
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Modem not detected");
         SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
@@ -1559,7 +1589,6 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         // First-time configuration
         ESP_LOGI(kTag, "Configuring network (first-time setup)...");
         SendAtWithRetry("AT+ECPCFG=\"usbCtrl\",1", resp, 1000, 3);
-        SendAtWithRetry("AT+CEREG=1", resp, 1000, 3);
         SendAtWithRetry("AT+ECNETCFG=\"nat\",1,\"192.168.10.2\"", resp, 1000, 3);
         SendAtWithRetry("AT&W", resp, 300, 3);
         
@@ -1612,21 +1641,32 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(kTag, "Starting network device...");
-    ret = SendAt("AT+ECNETDEVCTL=2,1,1", resp, 5000);
-    if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to start network device");
-        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
-        return ret;
+    int state=0;
+    if (SendAt("AT+ECNETDEVCTL?", resp, 1000) == ESP_OK) {
+        sscanf(resp.c_str(), "\r\n+ECNETDEVCTL: %*d,%*d,%*d,%d", &state);
     }
-
-    // Send handshake request
-    ESP_LOGI(kTag, "Starting handshake...");
-    ret = SendFrame(kHandshakeRequest, sizeof(kHandshakeRequest), FrameType::kEthernet);
-    if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Handshake failed");
-        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
-        return ret;
+    if(state == 1){
+        ESP_LOGI(kTag, "Network device already started");
+        handshake_done_ = true;
+        xEventGroupSetBits(event_group_, kEventHandshakeDone);
+        // Mark as initialized, but wait for IP_EVENT_ETH_GOT_IP for network ready
+        initialized_ = true;
+    } else {
+        ESP_LOGI(kTag, "Starting network device...");
+        ret = SendAt("AT+ECNETDEVCTL=2,1,1", resp, 5000);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "Failed to start network device");
+            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+            return ret;
+        }
+        // Send handshake request
+        ESP_LOGI(kTag, "Starting handshake...");
+        ret = SendFrame(kHandshakeRequest, sizeof(kHandshakeRequest), FrameType::kEthernet);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "Handshake failed");
+            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+            return ret;
+        }
     }
 
     // Wait for handshake ACK

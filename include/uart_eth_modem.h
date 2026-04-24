@@ -316,6 +316,7 @@ private:
     bool CheckSimCard();
     bool WaitForRegistration(uint32_t timeout_ms);
     void QueryModemInfo();
+    esp_err_t AtDetect();
 
     // GPIO control (low level = busy)
     void SetMrdy(MrdyLevel level);
