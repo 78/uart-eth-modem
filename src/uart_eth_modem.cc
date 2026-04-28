@@ -357,6 +357,20 @@ std::string UartEthModem::GetImei() {
     return imei_;
 }
 
+std::string UartEthModem::GetImsi() {
+    if (imsi_.empty()) {
+        std::string resp;
+        if (SendAt("AT+CIMI", resp) == ESP_OK) {
+            // Parse response using sscanf, consistent with C implementation
+            char imsi[16] = {0};
+            if (sscanf(resp.c_str(), "\r\n%15s", imsi) == 1) {
+                imsi_ = imsi;
+            }
+        }
+    }
+    return imsi_;
+}
+
 std::string UartEthModem::GetIccid() {
     if (iccid_.empty()) {
         std::string resp;
@@ -445,6 +459,7 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::ErrorRegistrationDenied: return "ErrorRegistrationDenied";
         case UartEthModemEvent::ErrorInitFailed: return "ErrorInitFailed";
         case UartEthModemEvent::ErrorNoCarrier: return "ErrorNoCarrier";
+        case UartEthModemEvent::PdpSetRequest: return "PdpSetRequest";
         default: return "Unknown";
     }
 }
@@ -1498,31 +1513,50 @@ esp_err_t UartEthModem::AtDetect() {
     std::string resp;
     esp_err_t ret;
     int baud_rates[] = {2000000, 3000000};
-    ret = SendAtWithRetry("AT", resp, 500, 6);
+    ret = SendAtWithRetry("AT", resp, 500, 4);
     if (ret == ESP_OK) {
+        detect_baud_rate_ = config_.baud_rate;
         return ESP_OK;
     }
     for (size_t i = 0; i < sizeof(baud_rates) / sizeof(baud_rates[0]); i++){
         uart_set_baudrate(config_.uart_num, baud_rates[i]);
         ESP_LOGI(kTag, "Trying baud rate: %d", baud_rates[i]);
-        ret = SendAtWithRetry("AT", resp, 500, 6);
+        ret = SendAtWithRetry("AT", resp, 500, 4);
         if (ret == ESP_OK) {
-            if(baud_rates[i] != config_.baud_rate){
-                SendAt("AT+XJCFG=netPortBaudRate,"+ std::to_string(config_.baud_rate), resp);
-                SendAt("AT+ECRST", resp, 500);
-                uart_set_baudrate(config_.uart_num, config_.baud_rate);
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                // Wait for modem to respond
-                ret = SendAtWithRetry("AT", resp, 500, 6);
-            }
-            return ret;
+            detect_baud_rate_ = baud_rates[i];
+            ESP_LOGI(kTag, "Detected baud rate: %d", detect_baud_rate_);
+            return ESP_OK;
         }
     }
     return ESP_FAIL;
 }
 
-
-
+esp_err_t UartEthModem::PdpSetUp() {
+    std::string resp;
+    esp_err_t ret;
+    if(apn_.empty()){
+        ESP_LOGI(kTag, "APN not set, using default");
+        return ESP_OK;
+    }
+    ret = SendAt("AT+CGDCONT?", resp, 1000);
+    if (ret == ESP_OK) {
+        char apn[128] = {0};
+        auto cgcont_pos = resp.find("+CGDCONT: 1");
+        if (cgcont_pos != std::string::npos) {
+            if (sscanf(resp.c_str()+cgcont_pos, "+CGDCONT: 1,\"%*[^\"]\",\"%127[^\"]\"", apn) == 1) {
+                if (std::strcmp(apn, apn_.c_str()) == 0){
+                    ESP_LOGI(kTag, "APN already set: %s", apn);
+                    return ESP_OK;
+                }
+            }
+        }
+        ESP_LOGI(kTag, "setting APN: %s,PDP Type: %s", apn_.c_str(), pdp_type_.c_str());
+        SendAt("AT+CFUN=0", resp, 5000);
+        SendAt("AT+CGDCONT=1,"+ pdp_type_ + "," + apn_ , resp);
+        ret = SendAt("AT+CFUN=1", resp, 5000);
+    }
+    return ret;
+}
 
 esp_err_t UartEthModem::RunFlightModeInitSequence() {
     std::string resp;
@@ -1564,20 +1598,13 @@ esp_err_t UartEthModem::RunFlightModeInitSequence() {
 esp_err_t UartEthModem::RunNormalModeInitSequence() {
     std::string resp;
     esp_err_t ret;
+    bool modem_need_reset = false;
 
     // Step 1: AT test
     ESP_LOGI(kTag, "Detecting modem...");
     ret = AtDetect();
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Modem not detected");
-        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
-        return ret;
-    }
-
-    // Enter full functionality mode (CFUN=1)
-    ret = SendAt("AT+CFUN=1", resp, 3000);
-    if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to enter full functionality mode");
         SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
         return ret;
     }
@@ -1590,14 +1617,25 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         ESP_LOGI(kTag, "Configuring network (first-time setup)...");
         SendAtWithRetry("AT+ECPCFG=\"usbCtrl\",1", resp, 1000, 3);
         SendAtWithRetry("AT+ECNETCFG=\"nat\",1,\"192.168.10.2\"", resp, 1000, 3);
-        SendAtWithRetry("AT&W", resp, 300, 3);
-        
+        modem_need_reset = true;
+    }
+
+    if(detect_baud_rate_ != config_.baud_rate){
+        ESP_LOGI(kTag, "Setting baud rate to configured value: %d", config_.baud_rate);
+        SendAt("AT+XJCFG=netPortBaudRate,"+ std::to_string(config_.baud_rate), resp);
+        modem_need_reset = true;
+    }
+
+    if(modem_need_reset){
+        modem_need_reset = false;
         // Reset after configuration
         xEventGroupClearBits(event_group_, kEventNetworkEventChanged);
-        SendAt("AT+ECRST", resp, 500);
-
-        vTaskDelay(pdMS_TO_TICKS(1500));
         
+        SendAt("AT+ECRST", resp, 500);
+        if(detect_baud_rate_ != config_.baud_rate){
+            uart_set_baudrate(config_.uart_num, config_.baud_rate);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1500));
         // Wait for modem to respond
         ret = SendAtWithRetry("AT", resp, 500, 20);
         if (ret != ESP_OK) {
@@ -1605,14 +1643,14 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
             SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
             return ret;
         }
+    }
 
-        // Enter full functionality mode (CFUN=1)
-        ret = SendAt("AT+CFUN=1", resp, 3000);
-        if (ret != ESP_OK) {
-            ESP_LOGE(kTag, "Failed to enter full functionality mode");
-            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
-            return ret;
-        }
+    // Enter full functionality mode (CFUN=1)
+    ret = SendAt("AT+CFUN=1", resp, 3000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Failed to enter full functionality mode");
+        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed);
+        return ret;
     }
 
     ESP_LOGI(kTag, "Checking SIM card...");
@@ -1625,9 +1663,12 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
     ESP_LOGI(kTag, "Querying modem info...");
     QueryModemInfo();
 
+    SetNetworkEvent(UartEthModemEvent::PdpSetRequest);
+    PdpSetUp();
+
     ESP_LOGI(kTag, "Waiting for network registration...");
     SetNetworkEvent(UartEthModemEvent::Connecting);
-    
+
     // Enable CEREG URC
     SendAt("AT+CEREG=2", resp);
     if (!WaitForRegistration(60000)) {
@@ -1748,40 +1789,10 @@ bool UartEthModem::WaitForRegistration(uint32_t timeout_ms) {
 }
 
 void UartEthModem::QueryModemInfo() {
-    std::string resp;
-
-    // Get IMEI using sscanf, consistent with C implementation
-    if (SendAt("AT+CGSN=1", resp, 1000) == ESP_OK) {
-        char imei[16] = {0};
-        if (sscanf(resp.c_str(), "\r\n+CGSN: \"%15s", imei) == 1) {
-            imei_ = imei;
-        }
-    }
-
-    // Get ICCID using sscanf, consistent with C implementation
-    if (SendAt("AT+ECICCID", resp, 1000) == ESP_OK) {
-        char iccid[21] = {0};
-        if (sscanf(resp.c_str(), "\r\n+ECICCID: %20s", iccid) == 1) {
-            iccid_ = iccid;
-        }
-    }
-
-    // Get module revision using sscanf, consistent with C implementation
-    if (SendAt("AT+CGMR", resp, 1000) == ESP_OK) {
-        char revision[128] = {0};
-        if (resp.find("+CGMR:") != std::string::npos) {
-            // Format: "\r\n+CGMR: \r\n<version>\r\n"
-            if (sscanf(resp.c_str(), "\r\n+CGMR: \r\n%127[^\r\n]", revision) == 1) {
-                module_revision_ = revision;
-            }
-        } else {
-            // Format: "\r\n<version>\r\n"
-            if (sscanf(resp.c_str(), "\r\n%127[^\r\n]", revision) == 1) {
-                module_revision_ = revision;
-            }
-        }
-    }
-
+    GetImei();
+    GetIccid();
+    GetModuleRevision();
+    GetImsi();
     ESP_LOGD(kTag, "Modem Info - IMEI: %s, ICCID: %s, Rev: %s", imei_.c_str(), iccid_.c_str(), module_revision_.c_str());
 }
 

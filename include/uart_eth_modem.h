@@ -81,6 +81,7 @@ public:
         ErrorRegistrationDenied, // Network registration denied (CEREG=3)
         ErrorInitFailed,         // Modem initialization failed (general error)
         ErrorNoCarrier,          // No carrier signal
+        PdpSetRequest,           // PDP context set request
     };
 
     // Cell information from CEREG
@@ -175,11 +176,17 @@ public:
 
     // Modem information getters
     std::string GetImei();
+    std::string GetImsi();
     std::string GetIccid();
     std::string GetCarrierName();
     std::string GetModuleRevision();
     int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
     CellInfo GetCellInfo();
+    // Set APN and PDP type for network registration
+    void SetPdpContext(const std::string& apn,const std::string& pdp_type="IP") {
+        apn_ = apn;
+        pdp_type_ = pdp_type;
+    }
 
     /**
     * @brief Get the network interface
@@ -317,6 +324,7 @@ private:
     bool WaitForRegistration(uint32_t timeout_ms);
     void QueryModemInfo();
     esp_err_t AtDetect();
+    esp_err_t PdpSetUp();
 
     // GPIO control (low level = busy)
     void SetMrdy(MrdyLevel level);
@@ -337,6 +345,7 @@ private:
 
     // Configuration
     Config config_;
+    int detect_baud_rate_;
 
     // Network initialization flag (atomic for thread safety)
     std::atomic<bool> initialized_{false};
@@ -387,8 +396,11 @@ private:
     // Modem information (cached)
     std::string imei_;
     std::string iccid_;
+    std::string imsi_;
     std::string carrier_name_;
     std::string module_revision_;
+    std::string pdp_type_="IP";  // Default PDP type
+    std::string apn_;
     int signal_strength_ = 99;
     CellInfo cell_info_;
     uint8_t mac_addr_[6] = {0};
