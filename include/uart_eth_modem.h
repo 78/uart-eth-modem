@@ -81,7 +81,7 @@ public:
         ErrorRegistrationDenied, // Network registration denied (CEREG=3)
         ErrorInitFailed,         // Modem initialization failed (general error)
         ErrorNoCarrier,          // No carrier signal
-        PdpSetRequest,           // PDP context set request
+        ConfiguringPdp,          // Configuring PDP context (APN), informational
     };
 
     // Cell information from CEREG
@@ -182,8 +182,14 @@ public:
     std::string GetModuleRevision();
     int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
     CellInfo GetCellInfo();
-    // Set APN and PDP type for network registration
-    void SetPdpContext(const std::string& apn,const std::string& pdp_type="IP") {
+    /**
+     * @brief Set APN and PDP type for network registration.
+     *
+     * Must be called BEFORE Start(). Not thread-safe; intended to be set once
+     * before the driver is started. If APN is empty, PDP context configuration
+     * is skipped and the modem default is used.
+     */
+    void SetPdpContext(const std::string& apn, const std::string& pdp_type = "IP") {
         apn_ = apn;
         pdp_type_ = pdp_type;
     }
@@ -324,7 +330,7 @@ private:
     bool WaitForRegistration(uint32_t timeout_ms);
     void QueryModemInfo();
     esp_err_t AtDetect();
-    esp_err_t PdpSetUp();
+    esp_err_t ConfigurePdp();
 
     // GPIO control (low level = busy)
     void SetMrdy(MrdyLevel level);
@@ -345,7 +351,7 @@ private:
 
     // Configuration
     Config config_;
-    int detect_baud_rate_;
+    int detect_baud_rate_ = 0;
 
     // Network initialization flag (atomic for thread safety)
     std::atomic<bool> initialized_{false};

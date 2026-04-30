@@ -459,7 +459,7 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::ErrorRegistrationDenied: return "ErrorRegistrationDenied";
         case UartEthModemEvent::ErrorInitFailed: return "ErrorInitFailed";
         case UartEthModemEvent::ErrorNoCarrier: return "ErrorNoCarrier";
-        case UartEthModemEvent::PdpSetRequest: return "PdpSetRequest";
+        case UartEthModemEvent::ConfiguringPdp: return "ConfiguringPdp";
         default: return "Unknown";
     }
 }
@@ -1531,28 +1531,45 @@ esp_err_t UartEthModem::AtDetect() {
     return ESP_FAIL;
 }
 
-esp_err_t UartEthModem::PdpSetUp() {
+esp_err_t UartEthModem::ConfigurePdp() {
     std::string resp;
     esp_err_t ret;
-    if(apn_.empty()){
+    if (apn_.empty()) {
         ESP_LOGI(kTag, "APN not set, using default");
         return ESP_OK;
     }
     ret = SendAt("AT+CGDCONT?", resp, 1000);
     if (ret == ESP_OK) {
-        char apn[128] = {0};
-        auto cgcont_pos = resp.find("+CGDCONT: 1");
+        // Use trailing comma to avoid matching CIDs like 11, 10, etc.
+        auto cgcont_pos = resp.find("+CGDCONT: 1,");
         if (cgcont_pos != std::string::npos) {
-            if (sscanf(resp.c_str()+cgcont_pos, "+CGDCONT: 1,\"%*[^\"]\",\"%127[^\"]\"", apn) == 1) {
-                if (std::strcmp(apn, apn_.c_str()) == 0){
-                    ESP_LOGI(kTag, "APN already set: %s", apn);
+            char pdp_type[16] = {0};
+            char apn[128] = {0};
+            if (sscanf(resp.c_str() + cgcont_pos,
+                       "+CGDCONT: 1,\"%15[^\"]\",\"%127[^\"]\"",
+                       pdp_type, apn) == 2) {
+                if (std::strcmp(apn, apn_.c_str()) == 0 &&
+                    std::strcmp(pdp_type, pdp_type_.c_str()) == 0) {
+                    ESP_LOGI(kTag, "APN already set: %s (%s)", apn, pdp_type);
                     return ESP_OK;
                 }
             }
         }
-        ESP_LOGI(kTag, "setting APN: %s,PDP Type: %s", apn_.c_str(), pdp_type_.c_str());
-        SendAt("AT+CFUN=0", resp, 5000);
-        SendAt("AT+CGDCONT=1,"+ pdp_type_ + "," + apn_ , resp);
+        // Only notify after we've decided to actually re-write the PDP context
+        // (i.e. APN/PDP type differs). Skip the event when APN is empty or
+        // already matches, to avoid a misleading "configuring APN" flap.
+        SetNetworkEvent(UartEthModemEvent::ConfiguringPdp);
+        ESP_LOGI(kTag, "setting APN: %s, PDP Type: %s", apn_.c_str(), pdp_type_.c_str());
+        esp_err_t cfun0_ret = SendAt("AT+CFUN=0", resp, 5000);
+        if (cfun0_ret != ESP_OK) {
+            ESP_LOGW(kTag, "CFUN=0 failed: %s", esp_err_to_name(cfun0_ret));
+        }
+        // 3GPP TS 27.007 requires PDP_type and APN to be quoted strings.
+        esp_err_t cgd_ret = SendAt(
+            "AT+CGDCONT=1,\"" + pdp_type_ + "\",\"" + apn_ + "\"", resp);
+        if (cgd_ret != ESP_OK) {
+            ESP_LOGW(kTag, "CGDCONT failed: %s", esp_err_to_name(cgd_ret));
+        }
         ret = SendAt("AT+CFUN=1", resp, 5000);
     }
     return ret;
@@ -1609,6 +1626,8 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         return ret;
     }
 
+    const bool baud_changed = (detect_baud_rate_ != config_.baud_rate);
+
     // Check and configure network settings
     ESP_LOGI(kTag, "Checking network configuration...");
     ret = SendAt("AT+ECNETCFG?", resp, 1000);
@@ -1620,19 +1639,19 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         modem_need_reset = true;
     }
 
-    if(detect_baud_rate_ != config_.baud_rate){
+    if (baud_changed) {
         ESP_LOGI(kTag, "Setting baud rate to configured value: %d", config_.baud_rate);
-        SendAt("AT+XJCFG=netPortBaudRate,"+ std::to_string(config_.baud_rate), resp);
+        SendAt("AT+XJCFG=netPortBaudRate," + std::to_string(config_.baud_rate), resp);
         modem_need_reset = true;
     }
 
-    if(modem_need_reset){
+    if (modem_need_reset) {
         modem_need_reset = false;
         // Reset after configuration
         xEventGroupClearBits(event_group_, kEventNetworkEventChanged);
-        
+
         SendAt("AT+ECRST", resp, 500);
-        if(detect_baud_rate_ != config_.baud_rate){
+        if (baud_changed) {
             uart_set_baudrate(config_.uart_num, config_.baud_rate);
         }
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -1663,8 +1682,7 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
     ESP_LOGI(kTag, "Querying modem info...");
     QueryModemInfo();
 
-    SetNetworkEvent(UartEthModemEvent::PdpSetRequest);
-    PdpSetUp();
+    ConfigurePdp();
 
     ESP_LOGI(kTag, "Waiting for network registration...");
     SetNetworkEvent(UartEthModemEvent::Connecting);
