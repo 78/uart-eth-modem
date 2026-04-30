@@ -459,7 +459,7 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::ErrorRegistrationDenied: return "ErrorRegistrationDenied";
         case UartEthModemEvent::ErrorInitFailed: return "ErrorInitFailed";
         case UartEthModemEvent::ErrorNoCarrier: return "ErrorNoCarrier";
-        case UartEthModemEvent::ConfiguringPdp: return "ConfiguringPdp";
+        case UartEthModemEvent::RequestingPdpContext: return "RequestingPdpContext";
         default: return "Unknown";
     }
 }
@@ -1534,6 +1534,12 @@ esp_err_t UartEthModem::AtDetect() {
 esp_err_t UartEthModem::ConfigurePdp() {
     std::string resp;
     esp_err_t ret;
+
+    // Notify upper layer that we are about to configure PDP context. If the
+    // event callback runs synchronously, it may call SetPdpContext() to inject
+    // apn_/pdp_type_ before we read them below.
+    SetNetworkEvent(UartEthModemEvent::RequestingPdpContext);
+
     if (apn_.empty()) {
         ESP_LOGI(kTag, "APN not set, using default");
         return ESP_OK;
@@ -1555,10 +1561,6 @@ esp_err_t UartEthModem::ConfigurePdp() {
                 }
             }
         }
-        // Only notify after we've decided to actually re-write the PDP context
-        // (i.e. APN/PDP type differs). Skip the event when APN is empty or
-        // already matches, to avoid a misleading "configuring APN" flap.
-        SetNetworkEvent(UartEthModemEvent::ConfiguringPdp);
         ESP_LOGI(kTag, "setting APN: %s, PDP Type: %s", apn_.c_str(), pdp_type_.c_str());
         esp_err_t cfun0_ret = SendAt("AT+CFUN=0", resp, 5000);
         if (cfun0_ret != ESP_OK) {

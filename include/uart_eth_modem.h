@@ -81,7 +81,8 @@ public:
         ErrorRegistrationDenied, // Network registration denied (CEREG=3)
         ErrorInitFailed,         // Modem initialization failed (general error)
         ErrorNoCarrier,          // No carrier signal
-        ConfiguringPdp,          // Configuring PDP context (APN), informational
+        RequestingPdpContext,    // Driver is about to configure PDP; clients may
+                                 // synchronously inject APN via SetPdpContext().
     };
 
     // Cell information from CEREG
@@ -185,9 +186,14 @@ public:
     /**
      * @brief Set APN and PDP type for network registration.
      *
-     * Must be called BEFORE Start(). Not thread-safe; intended to be set once
-     * before the driver is started. If APN is empty, PDP context configuration
-     * is skipped and the modem default is used.
+     * Call this either before Start(), or synchronously from the
+     * RequestingPdpContext event callback (the driver fires that event right
+     * before configuring PDP context, giving clients a chance to inject the
+     * APN). Asynchronous callbacks dispatched to another task are too late to
+     * influence the current init sequence; in that case use the pre-Start path.
+     *
+     * If APN is empty, PDP context configuration is skipped and the modem
+     * default is used. Not thread-safe.
      */
     void SetPdpContext(const std::string& apn, const std::string& pdp_type = "IP") {
         apn_ = apn;
