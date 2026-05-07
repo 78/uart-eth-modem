@@ -715,7 +715,8 @@ void UartEthModem::TxTaskRun() {
             last_activity_time_us_ = esp_timer_get_time();
             
             // Clear event bits before sending
-            ConfigureSrdyInterrupt(kSrdyInterruptForAck);
+            //ConfigureSrdyInterrupt(kSrdyInterruptForAck);
+            gpio_set_intr_type(config_.srdy_pin, GPIO_INTR_NEGEDGE);
             xEventGroupClearBits(event_group_, kEventSrdyHigh);
 
             // Transmit via UHCI (Synchronous FIFO mode)
@@ -750,6 +751,7 @@ void UartEthModem::TxTaskRun() {
             }
 
 done:
+            ConfigureSrdyInterrupt(kSrdyInterruptForAck);
             // Cleanup and notify
             free(frame.data);
             if (frame.done_sem) {
