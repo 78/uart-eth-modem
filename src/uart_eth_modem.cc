@@ -717,6 +717,7 @@ void UartEthModem::TxTaskRun() {
             // Clear event bits before sending
             //ConfigureSrdyInterrupt(kSrdyInterruptForAck);
             gpio_set_intr_type(config_.srdy_pin, GPIO_INTR_NEGEDGE);
+            gpio_intr_enable(config_.srdy_pin);
             xEventGroupClearBits(event_group_, kEventSrdyHigh);
 
             // Transmit via UHCI (Synchronous FIFO mode)
