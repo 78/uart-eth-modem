@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "iot_eth.h"
 #include "iot_eth_netif_glue.h"
+#include "iot_eth_types.h"
 
 /**
 * @brief UART Ethernet Modem driver for 4G modules (EC801E, NT26K, etc.)

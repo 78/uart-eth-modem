@@ -566,7 +566,7 @@ esp_err_t UartEthModem::InitIotEth() {
     iot_eth_config_t eth_cfg = {
         .driver = &driver_,
         .stack_input = nullptr,
-        .user_data = this,
+        .stack_input_info = nullptr,
     };
 
     esp_err_t ret = iot_eth_install(&eth_cfg, &eth_handle_);
@@ -631,10 +631,10 @@ esp_err_t UartEthModem::InitIotEth() {
     // Notify iot_eth of link state changes (critical for netif to work)
     // This triggers IOT_ETH_EVENT_CONNECTED which starts DHCP
     if (mediator_) {
-        // Notify MAC address available
-        mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_GET_MAC, nullptr);
-        // Notify link is up (IOT_ETH_LINK_UP = 0)
-        int link_status = 0;  // IOT_ETH_LINK_UP
+        // Notify low-level init done (MAC address is now available via get_addr)
+        mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LL_INIT, nullptr);
+        // Notify link is up; this triggers IOT_ETH_EVENT_CONNECTED which starts DHCP
+        iot_eth_link_t link_status = IOT_ETH_LINK_UP;
         mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LINK, &link_status);
     }
 
