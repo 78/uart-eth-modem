@@ -17,6 +17,7 @@ ESP32 上的 UART Ethernet Modem 驱动组件。通过 UHCI + GDMA 实现高效�
 - **事件驱动**: ISR、`TxTask`、应用层均通过 `event_queue_` 与 `event_group_` 与主任务异步通信。
 - **启动模式**: 支持普通联网模式、飞行模式和 RF 实验室测试模式；RF 测试模式只执行指定 AT 序列并保持 AT 传输层，不安装 `iot_eth` 网络接口。
 - **APN / PDP 配置**: 支持上层注入 APN 和 PDP 类型，启动时自动写入模组并按需重启；并对外发出 `RequestingPdpContext` 事件，供同步回调场景下回填配置。
+- **OOS 低功耗搜网**: 普通模式尝试把 `PlmnSearchPowerLevel` 设为 3，由上层通过 `RequestPlmnSearch()` 触发 `AT+ECPLMNS`；不支持该能力时恢复模组默认搜网，并通过事件报告注册丢失与降级状态。
 - **波特率自适应**: 启动阶段自动探测模组当前波特率（115200 / 2M / 3M），与目标值不一致时仅复位一次完成切换。
 
 > 完整的工作原理（状态机、DMA 缓冲区池、帧协议、事件流、低功耗等）请参见 [`WORKING_PRINCIPLE.md`](./WORKING_PRINCIPLE.md)。
@@ -51,6 +52,20 @@ modem->SetNetworkEventCallback([](UartEthModem::UartEthModemEvent ev,
 modem->Start();
 ```
 
+普通模式初始化后可查询应用是否已接管 OOS 搜网，并按产品自己的退避定时器恢复
+PLMN 搜索：
+
+```cpp
+if (modem->IsApplicationManagedPlmnSearchEnabled()) {
+    esp_err_t err = modem->RequestPlmnSearch();  // 发送 AT+ECPLMNS
+}
+```
+
+`RegistrationLost` 表示 `CEREG`、数据设备或 IP 已从可用状态转为 OOS；
+`PlmnSearchFallback` 表示 `ECPLMNS` 失败，组件已退出应用接管并尽力恢复模组默认
+搜网。旧模组拒绝 `PlmnSearchPowerLevel` 时，接口返回未接管，上层不得继续启动
+`ECPLMNS` 定时器。
+
 不传参数时，`Start()` 默认使用普通联网模式。需要飞行模式或 RF 测试模式时，通过 `StartMode` 显式选择启动序列：
 
 ```cpp
@@ -84,6 +99,11 @@ AT+CFUN=0
 该退出流程用于恢复正常 SIM 卡模式、重启模组使配置生效，并将模组切回 `AT+CFUN=0`，避免 RF 测试结束后继续保持全功能态。
 
 ## 变更日志 (Changelog)
+
+### Unreleased
+- 新增 `RequestPlmnSearch()`、`IsApplicationManagedPlmnSearchEnabled()`、`RegistrationLost` 和 `PlmnSearchFallback`，支持应用退避控制 OOS PLMN 搜索，并为旧模组提供 level 1 / CFUN 降级路径。
+- 注册恢复后保持 AT 控制任务存活，延后启动数据设备和 Ethernet link，取得 IP 后才发布 `Connected`。
+- `Stop()` 等待全部任务退出，AT mutex 等待可响应停止标志，避免快速 Wi-Fi / 4G 切换时释放仍被任务使用的资源。
 
 ### [0.6.0] - 2026-06-28
 - **接口变更**: `Start(bool flight_mode)` 替换为 `Start(StartMode mode = StartMode::kNormal)`，非默认模式需显式选择启动模式。

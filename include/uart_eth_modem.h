@@ -85,6 +85,8 @@ public:
         ErrorNoCarrier,          // No carrier signal
         RequestingPdpContext,    // Driver is about to configure PDP; clients may
                                  // synchronously inject APN via SetPdpContext().
+        RegistrationLost,        // CEREG moved from 1/5 to an out-of-service state
+        PlmnSearchFallback,      // App-managed search unavailable; modem default restored
     };
 
     // Cell information from CEREG
@@ -204,6 +206,10 @@ public:
     std::string GetModuleRevision();
     int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
     CellInfo GetCellInfo();
+    esp_err_t RequestPlmnSearch();
+    bool IsApplicationManagedPlmnSearchEnabled() const {
+        return application_managed_plmn_search_.load();
+    }
     /**
      * @brief Set APN and PDP type for network registration.
      *
@@ -359,6 +365,10 @@ private:
     void QueryModemInfo();
     esp_err_t AtDetect();
     esp_err_t ConfigurePdp();
+    bool ConfigureApplicationManagedPlmnSearch();
+    bool RestoreModemManagedPlmnSearch();
+    esp_err_t ActivateDataNetwork();
+    void SetDataLinkUp(bool up);
 
     // GPIO control (low level = busy)
     void SetMrdy(MrdyLevel level);
@@ -391,7 +401,9 @@ private:
 
     // Synchronization primitives
     QueueHandle_t event_queue_ = nullptr;
-    std::mutex at_mutex_;
+    // Timed so a task queued behind another AT command can observe Stop()
+    // instead of holding modem destruction hostage indefinitely.
+    std::timed_mutex at_mutex_;
     EventGroupHandle_t event_group_ = nullptr;
 
     // UHCI DMA
@@ -417,6 +429,8 @@ private:
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> handshake_done_{false};
     std::atomic<bool> initializing_{false};
+    std::atomic<bool> application_managed_plmn_search_{false};
+    std::atomic<bool> data_link_up_{false};
     std::atomic<uint8_t> seq_no_{0};
     std::atomic<bool> debug_enabled_{false};
     StartMode start_mode_{StartMode::kNormal};
@@ -455,6 +469,7 @@ private:
     iot_eth_netif_glue_handle_t glue_ = nullptr;
     esp_netif_t* eth_netif_ = nullptr;
     esp_event_handler_instance_t ip_event_handler_instance_ = nullptr;
+    esp_event_handler_instance_t lost_ip_event_handler_instance_ = nullptr;
 
     // Event bits
     static constexpr uint32_t kEventStart = (1 << 0);
@@ -466,6 +481,7 @@ private:
     static constexpr uint32_t kEventNetworkEventChanged = (1 << 6);
     static constexpr uint32_t kEventSrdyHigh = (1 << 7);
     static constexpr uint32_t kEventActiveState = (1 << 11);  // Set when entered active state with DMA ready
+    static constexpr uint32_t kEventRegistrationReady = (1 << 13);
 
     static constexpr uint32_t kEventMainTaskDone = (1 << 8);
     static constexpr uint32_t kEventInitTaskDone = (1 << 10);

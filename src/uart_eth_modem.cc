@@ -3,6 +3,7 @@
 
 #include "uart_eth_modem.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -106,6 +107,8 @@ esp_err_t UartEthModem::Start(StartMode mode) {
     stop_flag_ = false;
     handshake_done_ = false;
     initializing_ = true;
+    application_managed_plmn_search_ = false;
+    data_link_up_ = false;
 
     // Create event queue FIRST (before GPIO init, since ISR uses it)
     event_queue_ = xQueueCreate(32, sizeof(Event));
@@ -257,12 +260,19 @@ esp_err_t UartEthModem::Stop() {
         xQueueSend(tx_queue_, &dummy_frame, 0);
     }
 
-    // Wait for tasks to finish
+    // Wait for every task to finish. Resource destruction while even one task
+    // is alive is unsafe: task epilogues publish their done bit through this
+    // event group. A partial non-zero mask must not be mistaken for all tasks.
     if (event_group_) {
-        auto bits = xEventGroupWaitBits(event_group_, kEventAllTasksDone, pdTRUE, pdTRUE, pdMS_TO_TICKS(10000));
-        if (!(bits & kEventAllTasksDone)) {
-            ESP_LOGE(kTag, "Timeout to wait for tasks to finish");
-        }
+        EventBits_t bits = 0;
+        do {
+            bits = xEventGroupWaitBits(event_group_, kEventAllTasksDone,
+                                       pdTRUE, pdTRUE, pdMS_TO_TICKS(10000));
+            if ((bits & kEventAllTasksDone) != kEventAllTasksDone) {
+                ESP_LOGE(kTag, "Still waiting for modem tasks, completed mask=0x%lx",
+                         static_cast<unsigned long>(bits & kEventAllTasksDone));
+            }
+        } while ((bits & kEventAllTasksDone) != kEventAllTasksDone);
     }
 
     // Cleanup all resources including iot_eth
@@ -303,7 +313,12 @@ esp_err_t UartEthModem::ExitRfTestMode() {
 }
 
 esp_err_t UartEthModem::SendAt(const std::string& cmd, std::string& response, uint32_t timeout_ms) {
-    std::lock_guard<std::mutex> lock(at_mutex_);
+    std::unique_lock<std::timed_mutex> lock(at_mutex_, std::defer_lock);
+    while (!lock.try_lock_for(std::chrono::milliseconds(50))) {
+        if (stop_flag_.load()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
 
     // Check again after acquiring mutex in case Stop() was called while waiting
     if (stop_flag_.load()) {
@@ -483,6 +498,42 @@ UartEthModem::CellInfo UartEthModem::GetCellInfo() {
     return cell_info_;
 }
 
+esp_err_t UartEthModem::RequestPlmnSearch() {
+    if (!application_managed_plmn_search_.load()) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    std::string resp;
+    ESP_LOGI(kTag, "Requesting PLMN search with ECPLMNS");
+    esp_err_t ret = SendAt("AT+ECPLMNS", resp, 5000);
+    if (ret == ESP_OK) {
+        SetNetworkEvent(UartEthModemEvent::Connecting);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(kTag, "ECPLMNS failed (%s); restoring modem-managed PLMN search",
+             esp_err_to_name(ret));
+    const bool restored = RestoreModemManagedPlmnSearch();
+    if (!restored) {
+        // A module that accepted level 3 but rejects both ECPLMNS and the
+        // level-1 restore must not be left permanently out of service. CFUN
+        // cycling is the conservative legacy escape hatch recommended by the
+        // module vendor; it restarts registration without pretending that the
+        // application still owns PLMN timing.
+        std::string cfun_resp;
+        const esp_err_t cfun0 = SendAt("AT+CFUN=0", cfun_resp, 5000);
+        const esp_err_t cfun1 = cfun0 == ESP_OK
+            ? SendAt("AT+CFUN=1", cfun_resp, 5000) : cfun0;
+        ESP_LOGW(kTag, "PLMN fallback CFUN cycle result: %s",
+                 esp_err_to_name(cfun1));
+    }
+    application_managed_plmn_search_ = false;
+    SetNetworkEvent(UartEthModemEvent::PlmnSearchFallback,
+                    restored ? "ECPLMNS failed; restored modem-managed search"
+                             : "ECPLMNS and level restore failed; used CFUN restart");
+    return ret;
+}
+
 const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
     switch (event) {
         case UartEthModemEvent::Connecting: return "Connecting";
@@ -495,6 +546,8 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::ErrorInitFailed: return "ErrorInitFailed";
         case UartEthModemEvent::ErrorNoCarrier: return "ErrorNoCarrier";
         case UartEthModemEvent::RequestingPdpContext: return "RequestingPdpContext";
+        case UartEthModemEvent::RegistrationLost: return "RegistrationLost";
+        case UartEthModemEvent::PlmnSearchFallback: return "PlmnSearchFallback";
         default: return "Unknown";
     }
 }
@@ -628,14 +681,29 @@ esp_err_t UartEthModem::InitIotEth() {
         return ret;
     }
 
-    // Notify iot_eth of link state changes (critical for netif to work)
-    // This triggers IOT_ETH_EVENT_CONNECTED which starts DHCP
+    ret = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_LOST_IP,
+                                              &IpEventHandler, this,
+                                              &lost_ip_event_handler_instance_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Failed to register lost-IP event handler");
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ETH_GOT_IP,
+                                              ip_event_handler_instance_);
+        ip_event_handler_instance_ = nullptr;
+        iot_eth_stop(eth_handle_);
+        iot_eth_del_netif_glue(glue_);
+        glue_ = nullptr;
+        esp_netif_destroy(eth_netif_);
+        eth_netif_ = nullptr;
+        iot_eth_uninstall(eth_handle_);
+        eth_handle_ = nullptr;
+        return ret;
+    }
+
+    // Finish low-level setup, but keep the link down until registration and
+    // ECNETDEVCTL/handshake are ready. This lets the AT control plane remain
+    // alive while the application backs off PLMN searches.
     if (mediator_) {
-        // Notify low-level init done (MAC address is now available via get_addr)
         mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LL_INIT, nullptr);
-        // Notify link is up; this triggers IOT_ETH_EVENT_CONNECTED which starts DHCP
-        iot_eth_link_t link_status = IOT_ETH_LINK_UP;
-        mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LINK, &link_status);
     }
 
     // Clear DNS cache
@@ -672,6 +740,11 @@ void UartEthModem::DeinitIotEth() {
         esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ETH_GOT_IP,
                                               ip_event_handler_instance_);
         ip_event_handler_instance_ = nullptr;
+    }
+    if (lost_ip_event_handler_instance_) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ETH_LOST_IP,
+                                              lost_ip_event_handler_instance_);
+        lost_ip_event_handler_instance_ = nullptr;
     }
     if (eth_handle_) {
         iot_eth_stop(eth_handle_);
@@ -904,6 +977,14 @@ TickType_t UartEthModem::CalculateNextTimeout() {
 
 // Handle incoming event
 void UartEthModem::HandleEvent(const Event& event) {
+    // Wake the TX task from normal task context. Event-group operations from
+    // an ISR are deferred through the FreeRTOS timer queue; one of those
+    // deferred commands can otherwise outlive Stop() and target a deleted
+    // event group during a fast modem hand-off.
+    if (event.type == EventType::SrdyLow || event.type == EventType::SrdyHigh) {
+        xEventGroupSetBits(event_group_, kEventSrdyHigh);
+    }
+
     switch (event.type) {
         case EventType::TxRequest: {
             // Master wants to send data
@@ -1292,7 +1373,31 @@ void UartEthModem::InitTaskRun() {
 
         ESP_LOGD(kTag, "Initialization complete");
         initializing_ = false;
+        initialized_ = true;
         xEventGroupSetBits(event_group_, kEventInitDone);
+
+        if (start_mode_ == StartMode::kNormal) {
+            // Stay alive as the cellular control task. Registration may return
+            // minutes later after an application-triggered ECPLMNS; activation
+            // of ECNETDEVCTL and the Ethernet link must then happen in task
+            // context rather than inside the AT response parser.
+            while (!stop_flag_.load()) {
+                if (cell_info_.stat == 1 || cell_info_.stat == 5) {
+                    esp_err_t activate_ret = ActivateDataNetwork();
+                    if (activate_ret != ESP_OK && activate_ret != ESP_ERR_INVALID_STATE) {
+                        ESP_LOGW(kTag, "Data-network activation failed: %s",
+                                 esp_err_to_name(activate_ret));
+                    }
+                }
+
+                EventBits_t bits = xEventGroupWaitBits(
+                    event_group_, kEventRegistrationReady | kEventStop,
+                    pdTRUE, pdFALSE, portMAX_DELAY);
+                if (bits & kEventStop) {
+                    break;
+                }
+            }
+        }
     }
 
 exit:
@@ -1515,6 +1620,7 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
     // Parse CEREG following at_modem.cc logic
     auto cereg_pos = response.find("+CEREG:");
     if (cereg_pos != std::string::npos) {
+        const int previous_stat = cell_info_.stat;
         int n = 0, stat = 0;
         char tac[16] = {0}, ci[16] = {0};
         int act = 0;
@@ -1542,21 +1648,45 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
             cell_info_.stat = stat;
         }
 
-        // Check registration status (mirrored from at_modem.cc HandleUrc logic)
+        // Registration and IP readiness are separate. CONNECTED is emitted
+        // only by IP_EVENT_ETH_GOT_IP after the persistent control task has
+        // activated ECNETDEVCTL and raised the Ethernet link.
         bool new_network_ready = cell_info_.stat == 1 || cell_info_.stat == 5;
         if (cell_info_.stat == 2) {
             SetNetworkEvent(UartEthModemEvent::Connecting);
         } else if (cell_info_.stat == 3) {
             SetNetworkEvent(UartEthModemEvent::ErrorRegistrationDenied);
         } else if (new_network_ready) {
-            if (initialized_.load()) {
-                SetNetworkEvent(UartEthModemEvent::Connected);
+            if (event_group_) {
+                xEventGroupSetBits(event_group_, kEventRegistrationReady);
+            }
+            if (previous_stat != 1 && previous_stat != 5) {
+                SetNetworkEvent(UartEthModemEvent::Connecting,
+                                "cellular registration restored");
+            }
+        } else if (cell_info_.stat == 0 || cell_info_.stat == 4) {
+            if (previous_stat == 1 || previous_stat == 5 || data_link_up_.load()) {
+                SetDataLinkUp(false);
+                SetNetworkEvent(UartEthModemEvent::RegistrationLost,
+                                "cellular out of service");
             }
         }
     } else if (response.find("+ECNETDEVCTL: 1") != std::string::npos) {
         // Network device ready (link up)
     } else if (response.find("+ECNETDEVCTL: 0") != std::string::npos) {
-        // Network device down (link down)
+        const bool was_data_ready = handshake_done_ || data_link_up_.load();
+        handshake_done_ = false;
+        SetDataLinkUp(false);
+        // ECNETDEVCTL? legitimately returns 0 before the first activation; it
+        // is not an OOS transition. Only report a loss after the data plane
+        // had previously completed its handshake or raised link.
+        if (was_data_ready) {
+            SetNetworkEvent(UartEthModemEvent::RegistrationLost,
+                            "cellular data device down");
+        }
+        if ((cell_info_.stat == 1 || cell_info_.stat == 5) && event_group_) {
+            xEventGroupSetBits(event_group_, kEventRegistrationReady);
+        }
     }
 }
 
@@ -1628,6 +1758,101 @@ esp_err_t UartEthModem::ConfigurePdp() {
     return ret;
 }
 
+bool UartEthModem::ConfigureApplicationManagedPlmnSearch() {
+    std::string resp;
+    esp_err_t ret = SendAt("AT+ECCFG=\"PlmnSearchPowerLevel\",3", resp, 2000);
+    if (ret != ESP_OK) {
+        ret = SendAt("AT+ECCFG=PlmnSearchPowerLevel,3", resp, 2000);
+    }
+
+    application_managed_plmn_search_ = (ret == ESP_OK);
+    if (ret == ESP_OK) {
+        ESP_LOGI(kTag, "Application-managed PLMN search enabled (level 3)");
+        return true;
+    }
+
+    // An AT timeout is ambiguous: the modem may have applied level 3 while
+    // losing only the response. Best-effort restore level 1 so a failed setup
+    // cannot silently leave an old/unknown module with search disabled.
+    const bool restored = RestoreModemManagedPlmnSearch();
+    application_managed_plmn_search_ = false;
+    ESP_LOGW(kTag, "PlmnSearchPowerLevel=3 unavailable; %s",
+             restored ? "restored modem-managed level 1"
+                      : "module rejected ECCFG, preserving its built-in behavior");
+    return false;
+}
+
+bool UartEthModem::RestoreModemManagedPlmnSearch() {
+    std::string resp;
+    esp_err_t ret = SendAt("AT+ECCFG=\"PlmnSearchPowerLevel\",1", resp, 2000);
+    if (ret != ESP_OK) {
+        ret = SendAt("AT+ECCFG=PlmnSearchPowerLevel,1", resp, 2000);
+    }
+    if (ret == ESP_OK) {
+        application_managed_plmn_search_ = false;
+        return true;
+    }
+    ESP_LOGE(kTag, "Failed to restore modem-managed PLMN search");
+    return false;
+}
+
+void UartEthModem::SetDataLinkUp(bool up) {
+    const bool previous = data_link_up_.exchange(up);
+    if (previous == up || !mediator_) {
+        return;
+    }
+
+    iot_eth_link_t link_status = up ? IOT_ETH_LINK_UP : IOT_ETH_LINK_DOWN;
+    mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LINK, &link_status);
+    ESP_LOGI(kTag, "Cellular data link %s", up ? "up" : "down");
+}
+
+esp_err_t UartEthModem::ActivateDataNetwork() {
+    if (stop_flag_.load() || data_link_up_.load()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (cell_info_.stat != 1 && cell_info_.stat != 5) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    std::string resp;
+    int state = 0;
+    if (SendAt("AT+ECNETDEVCTL?", resp, 1000) == ESP_OK) {
+        sscanf(resp.c_str(), "\r\n+ECNETDEVCTL: %*d,%*d,%*d,%d", &state);
+    }
+
+    if (state == 1) {
+        ESP_LOGI(kTag, "Network device already started");
+        handshake_done_ = true;
+        xEventGroupSetBits(event_group_, kEventHandshakeDone);
+    } else {
+        handshake_done_ = false;
+        xEventGroupClearBits(event_group_, kEventHandshakeDone);
+        ESP_LOGI(kTag, "Starting network device...");
+        esp_err_t ret = SendAt("AT+ECNETDEVCTL=2,1,1", resp, 5000);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        ret = SendFrame(kHandshakeRequest, sizeof(kHandshakeRequest), FrameType::kEthernet);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        event_group_, kEventHandshakeDone | kEventStop,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(kHandshakeTimeoutMs));
+    if (bits & kEventStop) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!(bits & kEventHandshakeDone)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    SetDataLinkUp(true);
+    return ESP_OK;
+}
+
 esp_err_t UartEthModem::RunFlightModeInitSequence() {
     std::string resp;
     esp_err_t ret;
@@ -1651,6 +1876,10 @@ esp_err_t UartEthModem::RunFlightModeInitSequence() {
 
     ESP_LOGI(kTag, "Checking SIM card...");
     if (!CheckSimCard()) {
+        if (stop_flag_.load()) {
+            ESP_LOGI(kTag, "SIM check cancelled during modem shutdown");
+            return ESP_ERR_INVALID_STATE;
+        }
         ESP_LOGE(kTag, "SIM card not ready");
         SetNetworkEvent(UartEthModemEvent::ErrorNoSim);
         return ESP_ERR_INVALID_STATE;
@@ -1775,6 +2004,10 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
 
     ESP_LOGI(kTag, "Checking SIM card...");
     if (!CheckSimCard()) {
+        if (stop_flag_.load()) {
+            ESP_LOGI(kTag, "SIM check cancelled during modem shutdown");
+            return ESP_ERR_INVALID_STATE;
+        }
         ESP_LOGE(kTag, "SIM card not ready");
         SetNetworkEvent(UartEthModemEvent::ErrorNoSim);
         return ESP_ERR_INVALID_STATE;
@@ -1785,64 +2018,12 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
 
     ConfigurePdp();
 
-    ESP_LOGI(kTag, "Waiting for network registration...");
-    SetNetworkEvent(UartEthModemEvent::Connecting);
+    // Configure this before waiting for service. Older module revisions may
+    // reject ECCFG; in that case their default level-1 periodic search remains
+    // untouched and the application must not schedule ECPLMNS.
+    ConfigureApplicationManagedPlmnSearch();
 
-    // Enable CEREG URC
-    SendAt("AT+CEREG=2", resp);
-    if (!WaitForRegistration(60000)) {
-        if (cell_info_.stat == 3) {
-            ESP_LOGE(kTag, "Registration denied");
-            SetNetworkEvent(UartEthModemEvent::ErrorRegistrationDenied);
-        } else {
-            ESP_LOGE(kTag, "Registration timeout");
-            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Network registration timeout");
-        }
-        return ESP_ERR_TIMEOUT;
-    }
-
-    int state=0;
-    if (SendAt("AT+ECNETDEVCTL?", resp, 1000) == ESP_OK) {
-        sscanf(resp.c_str(), "\r\n+ECNETDEVCTL: %*d,%*d,%*d,%d", &state);
-    }
-    if(state == 1){
-        ESP_LOGI(kTag, "Network device already started");
-        handshake_done_ = true;
-        xEventGroupSetBits(event_group_, kEventHandshakeDone);
-        // Mark as initialized, but wait for IP_EVENT_ETH_GOT_IP for network ready
-        initialized_ = true;
-    } else {
-        ESP_LOGI(kTag, "Starting network device...");
-        ret = SendAt("AT+ECNETDEVCTL=2,1,1", resp, 5000);
-        if (ret != ESP_OK) {
-            ESP_LOGE(kTag, "Failed to start network device");
-            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Failed to start network device (ECNETDEVCTL)");
-            return ret;
-        }
-        // Send handshake request
-        ESP_LOGI(kTag, "Starting handshake...");
-        ret = SendFrame(kHandshakeRequest, sizeof(kHandshakeRequest), FrameType::kEthernet);
-        if (ret != ESP_OK) {
-            ESP_LOGE(kTag, "Handshake failed");
-            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Handshake request send failed");
-            return ret;
-        }
-    }
-
-    // Wait for handshake ACK
-    auto bits = xEventGroupWaitBits(event_group_, kEventHandshakeDone | kEventStop, pdFALSE, pdFALSE, pdMS_TO_TICKS(kHandshakeTimeoutMs));
-    if (bits & kEventStop) {
-        ESP_LOGW(kTag, "Stop event received in WaitForHandshake");
-        return ESP_ERR_INVALID_STATE;
-    } else if (bits & kEventHandshakeDone) {
-        ESP_LOGI(kTag, "Handshake successful");
-    } else {
-        ESP_LOGE(kTag, "Handshake timeout");
-        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Handshake timeout");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // Set modem sleep parameters
+    // Set modem sleep parameters while the AT control plane is available.
     ret = SendAt("AT+ECSCLKEX=1," + std::to_string(kModemSleepTimeoutS) + ",30", resp, 1000);
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Failed to set modem sleep parameters");
@@ -1850,7 +2031,14 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
         return ret;
     }
 
-    ESP_LOGI(kTag, "Modem initialization complete!");
+    // Registration has no component-owned timeout. CEREG URCs drive the
+    // persistent control task, and the top-level policy decides when ECPLMNS
+    // should be retried.
+    SendAt("AT+CEREG=2", resp);
+    SetNetworkEvent(UartEthModemEvent::Connecting);
+    GetCellInfo();
+
+    ESP_LOGI(kTag, "Modem control plane initialized; waiting for registration");
     return ESP_OK;
 }
 
@@ -1968,9 +2156,6 @@ void IRAM_ATTR UartEthModem::SrdyIsrHandler(void* arg) {
 
     xQueueSendFromISR(self->event_queue_, &event, &xHigherPriorityTaskWoken);
 
-    // Set event group bit for SRDY high (used by WaitForSrdyAck)
-    xEventGroupSetBitsFromISR(self->event_group_, kEventSrdyHigh, &xHigherPriorityTaskWoken);
-
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
@@ -2007,6 +2192,13 @@ void UartEthModem::IpEventHandler(void* arg, esp_event_base_t event_base,
         if (self->event_group_) {
             xEventGroupSetBits(self->event_group_, kEventNetworkReady);
         }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_LOST_IP) {
+        self->SetDataLinkUp(false);
+        self->SetNetworkEvent(UartEthModemEvent::RegistrationLost,
+                              "cellular interface lost IP");
+        if ((self->cell_info_.stat == 1 || self->cell_info_.stat == 5) && self->event_group_) {
+            xEventGroupSetBits(self->event_group_, kEventRegistrationReady);
+        }
     }
 }
 
@@ -2015,6 +2207,10 @@ void UartEthModem::CleanupResources(bool cleanup_iot_eth) {
     if (cleanup_iot_eth) {
         DeinitIotEth();
     }
+
+    // Stop the GPIO ISR before deleting any queue or event object it can
+    // reference. Tasks have already joined when Stop() calls this routine.
+    DeinitGpio();
 
     // Cleanup UHCI controller
     uart_uhci_.Deinit();
@@ -2049,7 +2245,6 @@ void UartEthModem::CleanupResources(bool cleanup_iot_eth) {
         event_queue_ = nullptr;
     }
 
-    // Cleanup GPIO and UART
-    DeinitGpio();
+    // Cleanup UART
     DeinitUart();
 }
