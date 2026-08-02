@@ -154,6 +154,15 @@ public:
     esp_err_t Stop();
 
     /**
+     * @brief Prevent new cellular data-plane activation before graceful shutdown
+     *
+     * This keeps the AT control plane available for commands such as CFUN=0,
+     * while waiting for any in-flight ECNETDEVCTL activation to leave its
+     * critical section. Stop() also applies this barrier automatically.
+     */
+    void PrepareForShutdown();
+
+    /**
     * @brief Exit RF lab test mode
     *
     * This restores normal SIM-card mode, reboots the module so the setting
@@ -404,6 +413,8 @@ private:
     // Timed so a task queued behind another AT command can observe Stop()
     // instead of holding modem destruction hostage indefinitely.
     std::timed_mutex at_mutex_;
+    // Serializes ECNETDEVCTL activation against graceful modem shutdown.
+    std::mutex data_activation_mutex_;
     EventGroupHandle_t event_group_ = nullptr;
 
     // UHCI DMA
@@ -431,6 +442,7 @@ private:
     std::atomic<bool> initializing_{false};
     std::atomic<bool> application_managed_plmn_search_{false};
     std::atomic<bool> data_link_up_{false};
+    std::atomic<bool> data_activation_blocked_{false};
     std::atomic<uint8_t> seq_no_{0};
     std::atomic<bool> debug_enabled_{false};
     StartMode start_mode_{StartMode::kNormal};
@@ -482,6 +494,7 @@ private:
     static constexpr uint32_t kEventSrdyHigh = (1 << 7);
     static constexpr uint32_t kEventActiveState = (1 << 11);  // Set when entered active state with DMA ready
     static constexpr uint32_t kEventRegistrationReady = (1 << 13);
+    static constexpr uint32_t kEventDataActivationBlocked = (1 << 14);
 
     static constexpr uint32_t kEventMainTaskDone = (1 << 8);
     static constexpr uint32_t kEventInitTaskDone = (1 << 10);

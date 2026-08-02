@@ -83,6 +83,10 @@ graph TB
 ### 核心组件
 
 - **UartEthModem**：主驱动类，管理状态机、帧协议、AT 命令、初始化序列。
+- **实现文件边界**：`uart_eth_modem.cc` 管理生命周期和公开 API，
+  `uart_eth_modem_platform.cc` 管理硬件/netif 资源，
+  `uart_eth_modem_transport.cc` 管理任务、状态机和帧传输，
+  `uart_eth_modem_control.cc` 管理 AT 解析和蜂窝注册流程。
 - **UartUhci**：UHCI + GDMA 控制器（独立组件 `components/uart-uhci`），提供：
   - 基于缓冲区池 + GDMA owner 的持续 RX；
   - 同步阻塞的 TX FIFO 写入（不占用 GDMA 通道）；

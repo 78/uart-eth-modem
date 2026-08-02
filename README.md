@@ -101,6 +101,7 @@ AT+CFUN=0
 ## 变更日志 (Changelog)
 
 ### Unreleased
+- 将单一实现文件按生命周期、平台、传输和模组控制职责拆分，保持公开接口与运行行为不变，便于按日志模块定位问题。
 - 新增 `RequestPlmnSearch()`、`IsApplicationManagedPlmnSearchEnabled()`、`RegistrationLost` 和 `PlmnSearchFallback`，支持应用退避控制 OOS PLMN 搜索，并为旧模组提供 level 1 / CFUN 降级路径。
 - 注册恢复后保持 AT 控制任务存活，延后启动数据设备和 Ethernet link，取得 IP 后才发布 `Connected`。
 - `Stop()` 等待全部任务退出，AT mutex 等待可响应停止标志，避免快速 Wi-Fi / 4G 切换时释放仍被任务使用的资源。
@@ -132,6 +133,16 @@ AT+CFUN=0
 ## 核心原理概述
 
 > 详细内容请参考 [`WORKING_PRINCIPLE.md`](./WORKING_PRINCIPLE.md)。
+
+实现按故障域拆分为四个翻译单元，公开接口仍统一保留在
+`include/uart_eth_modem.h`：
+
+| 文件 | 职责 |
+|------|------|
+| `uart_eth_modem.cc` | 对象生命周期、公开 API、同步 AT 命令入口 |
+| `uart_eth_modem_platform.cc` | UART/GPIO、`iot_eth`/`esp_netif`、中断与资源清理 |
+| `uart_eth_modem_transport.cc` | TX/Main 任务、MRDY/SRDY 状态机、帧收发与重组 |
+| `uart_eth_modem_control.cc` | Init 任务、AT 响应解析、SIM/PDP/PLMN 与启动序列 |
 
 ### 1. 系统架构
 驱动采用分层架构：
