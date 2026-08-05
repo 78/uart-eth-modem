@@ -107,8 +107,8 @@ esp_err_t UartEthModem::Start(StartMode mode) {
     stop_flag_ = false;
     handshake_done_ = false;
     initializing_ = true;
-    application_managed_plmn_search_ = false;
     data_link_up_ = false;
+    ip_ready_ = false;
     data_activation_blocked_ = false;
     xEventGroupClearBits(event_group_, kEventDataActivationBlocked);
 
@@ -508,46 +508,59 @@ int UartEthModem::GetSignalStrength() {
 
 UartEthModem::CellInfo UartEthModem::GetCellInfo() {
     std::string resp;
-    if (SendAt("AT+CEREG?", resp) == ESP_OK) {
-        ParseAtResponse(resp);
-    }
+    // HandleAtResponse() parses the received frame before it wakes SendAt(),
+    // so parsing the returned copy again would duplicate both state handling
+    // and debug output.
+    SendAt("AT+CEREG?", resp);
     return cell_info_;
 }
 
-esp_err_t UartEthModem::RequestPlmnSearch() {
-    if (!application_managed_plmn_search_.load()) {
-        return ESP_ERR_NOT_SUPPORTED;
+esp_err_t UartEthModem::RestartRegistration() {
+    if (!initialized_.load() || start_mode_ != StartMode::kNormal ||
+        stop_flag_.load() || data_activation_blocked_.load()) {
+        return ESP_ERR_INVALID_STATE;
     }
+
+    // Keep CFUN changes from racing ECNETDEVCTL activation after a late CEREG
+    // URC. SendAt() supplies AT-channel serialization; this mutex covers the
+    // larger registration/data-plane transition.
+    std::lock_guard<std::mutex> activation_lock(data_activation_mutex_);
+    if (stop_flag_.load() || data_activation_blocked_.load()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(kTag, "Restarting cellular registration with CFUN=0/1");
+    handshake_done_ = false;
+    if (event_group_) xEventGroupClearBits(event_group_, kEventHandshakeDone);
+    SetDataLinkUp(false);
 
     std::string resp;
-    ESP_LOGI(kTag, "Requesting PLMN search with ECPLMNS");
-    esp_err_t ret = SendAt("AT+ECPLMNS", resp, 5000);
-    if (ret == ESP_OK) {
-        SetNetworkEvent(UartEthModemEvent::Connecting);
-        return ESP_OK;
+    const esp_err_t cfun0 = SendAt("AT+CFUN=0", resp, 5000);
+    if (cfun0 != ESP_OK) {
+        ESP_LOGW(kTag, "CFUN=0 registration restart failed: %s",
+                 esp_err_to_name(cfun0));
     }
 
-    ESP_LOGW(kTag, "ECPLMNS failed (%s); restoring modem-managed PLMN search",
-             esp_err_to_name(ret));
-    const bool restored = RestoreModemManagedPlmnSearch();
-    if (!restored) {
-        // A module that accepted level 3 but rejects both ECPLMNS and the
-        // level-1 restore must not be left permanently out of service. CFUN
-        // cycling is the conservative legacy escape hatch recommended by the
-        // module vendor; it restarts registration without pretending that the
-        // application still owns PLMN timing.
-        std::string cfun_resp;
-        const esp_err_t cfun0 = SendAt("AT+CFUN=0", cfun_resp, 5000);
-        const esp_err_t cfun1 = cfun0 == ESP_OK
-            ? SendAt("AT+CFUN=1", cfun_resp, 5000) : cfun0;
-        ESP_LOGW(kTag, "PLMN fallback CFUN cycle result: %s",
+    // Always attempt CFUN=1. A missing CFUN=0 response is ambiguous, and
+    // leaving the modem outside full-function mode would make recovery worse.
+    const esp_err_t cfun1 = SendAt("AT+CFUN=1", resp, 5000);
+    if (cfun1 != ESP_OK) {
+        ESP_LOGW(kTag, "CFUN=1 registration restart failed: %s",
                  esp_err_to_name(cfun1));
+        return cfun1;
     }
-    application_managed_plmn_search_ = false;
-    SetNetworkEvent(UartEthModemEvent::PlmnSearchFallback,
-                    restored ? "ECPLMNS failed; restored modem-managed search"
-                             : "ECPLMNS and level restore failed; used CFUN restart");
-    return ret;
+
+    SetNetworkEvent(UartEthModemEvent::Connecting,
+                    "registration restarted with CFUN=0/1");
+    SendAt("AT+CEREG?", resp, 1000);
+    return cfun0;
+}
+
+esp_err_t UartEthModem::RequestPlmnSearch() {
+    // Retained for source compatibility with 0.6.2. ECPLMNS is absent on
+    // deployed module firmware, so new and old callers receive an explicit
+    // unsupported result without transmitting an AT command.
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {

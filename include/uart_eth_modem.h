@@ -85,7 +85,7 @@ public:
         ErrorNoCarrier,          // No carrier signal
         RequestingPdpContext,    // Driver is about to configure PDP; clients may
                                  // synchronously inject APN via SetPdpContext().
-        RegistrationLost,        // CEREG moved from 1/5 to an out-of-service state
+        RegistrationLost,        // CEREG=0/4: not registered and not searching/unknown
         PlmnSearchFallback,      // App-managed search unavailable; modem default restored
     };
 
@@ -215,10 +215,18 @@ public:
     std::string GetModuleRevision();
     int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
     CellInfo GetCellInfo();
+    /**
+     * @brief Restart cellular registration with AT+CFUN=0 / AT+CFUN=1.
+     *
+     * Intended for an application-owned, low-frequency OOS retry timer. The
+     * modem keeps its default PLMN search policy between retries.
+     */
+    esp_err_t RestartRegistration();
+
+    // Legacy application-managed PLMN search API. New integrations should
+    // keep the modem's default search policy and call RestartRegistration().
     esp_err_t RequestPlmnSearch();
-    bool IsApplicationManagedPlmnSearchEnabled() const {
-        return application_managed_plmn_search_.load();
-    }
+    bool IsApplicationManagedPlmnSearchEnabled() const { return false; }
     /**
      * @brief Set APN and PDP type for network registration.
      *
@@ -374,8 +382,6 @@ private:
     void QueryModemInfo();
     esp_err_t AtDetect();
     esp_err_t ConfigurePdp();
-    bool ConfigureApplicationManagedPlmnSearch();
-    bool RestoreModemManagedPlmnSearch();
     esp_err_t ActivateDataNetwork();
     void SetDataLinkUp(bool up);
 
@@ -440,8 +446,11 @@ private:
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> handshake_done_{false};
     std::atomic<bool> initializing_{false};
-    std::atomic<bool> application_managed_plmn_search_{false};
     std::atomic<bool> data_link_up_{false};
+    // Tracks data-plane readiness separately from cellular registration.
+    // CEREG may briefly report searching while the retained IP path remains
+    // usable, so registration URCs alone must not demote a connected netif.
+    std::atomic<bool> ip_ready_{false};
     std::atomic<bool> data_activation_blocked_{false};
     std::atomic<uint8_t> seq_no_{0};
     std::atomic<bool> debug_enabled_{false};

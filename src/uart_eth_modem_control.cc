@@ -68,7 +68,7 @@ void UartEthModem::InitTaskRun() {
 
         if (start_mode_ == StartMode::kNormal) {
             // Stay alive as the cellular control task. Registration may return
-            // minutes later after an application-triggered ECPLMNS; activation
+            // minutes later after a modem search or CFUN restart; activation
             // of ECNETDEVCTL and the Ethernet link must then happen in task
             // context rather than inside the AT response parser.
             while (!stop_flag_.load()) {
@@ -163,9 +163,11 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
             cell_info_.stat = stat;
         }
 
-        // Registration and IP readiness are separate. CONNECTED is emitted
-        // only by IP_EVENT_ETH_GOT_IP after the persistent control task has
-        // activated ECNETDEVCTL and raised the Ethernet link.
+        // Registration and IP readiness are separate. CEREG=2 means service
+        // registration is searching, so report Connecting immediately even
+        // if the netif still retains its previous IP. If registration returns
+        // while that IP remains usable, restore Connected below without
+        // waiting for another GOT_IP event.
         bool new_network_ready = cell_info_.stat == 1 || cell_info_.stat == 5;
         if (cell_info_.stat == 2) {
             SetNetworkEvent(UartEthModemEvent::Connecting);
@@ -176,15 +178,27 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
                 xEventGroupSetBits(event_group_, kEventRegistrationReady);
             }
             if (previous_stat != 1 && previous_stat != 5) {
-                SetNetworkEvent(UartEthModemEvent::Connecting,
-                                "cellular registration restored");
+                if (data_link_up_.load() && ip_ready_.load()) {
+                    SetNetworkEvent(UartEthModemEvent::Connected,
+                                    "cellular registration restored with IP retained");
+                } else {
+                    SetNetworkEvent(UartEthModemEvent::Connecting,
+                                    "cellular registration restored; waiting for IP");
+                }
             }
         } else if (cell_info_.stat == 0 || cell_info_.stat == 4) {
             if (previous_stat == 1 || previous_stat == 5 || data_link_up_.load()) {
                 SetDataLinkUp(false);
-                SetNetworkEvent(UartEthModemEvent::RegistrationLost,
-                                "cellular out of service");
             }
+            // CEREG=0/4 is observably different from CEREG=2: the modem is
+            // not searching at this instant. Report it even before the first
+            // successful registration so the application can distinguish an
+            // exhausted/idle search from an active one. Duplicate reports are
+            // suppressed by SetNetworkEvent().
+            SetNetworkEvent(UartEthModemEvent::RegistrationLost,
+                            cell_info_.stat == 0
+                                ? "cellular not registered and not searching"
+                                : "cellular registration state unknown");
         }
     } else if (response.find("+ECNETDEVCTL: 1") != std::string::npos) {
         // Network device ready (link up)
@@ -273,45 +287,10 @@ esp_err_t UartEthModem::ConfigurePdp() {
     return ret;
 }
 
-bool UartEthModem::ConfigureApplicationManagedPlmnSearch() {
-    std::string resp;
-    esp_err_t ret = SendAt("AT+ECCFG=\"PlmnSearchPowerLevel\",3", resp, 2000);
-    if (ret != ESP_OK) {
-        ret = SendAt("AT+ECCFG=PlmnSearchPowerLevel,3", resp, 2000);
-    }
-
-    application_managed_plmn_search_ = (ret == ESP_OK);
-    if (ret == ESP_OK) {
-        ESP_LOGI(kTag, "Application-managed PLMN search enabled (level 3)");
-        return true;
-    }
-
-    // An AT timeout is ambiguous: the modem may have applied level 3 while
-    // losing only the response. Best-effort restore level 1 so a failed setup
-    // cannot silently leave an old/unknown module with search disabled.
-    const bool restored = RestoreModemManagedPlmnSearch();
-    application_managed_plmn_search_ = false;
-    ESP_LOGW(kTag, "PlmnSearchPowerLevel=3 unavailable; %s",
-             restored ? "restored modem-managed level 1"
-                      : "module rejected ECCFG, preserving its built-in behavior");
-    return false;
-}
-
-bool UartEthModem::RestoreModemManagedPlmnSearch() {
-    std::string resp;
-    esp_err_t ret = SendAt("AT+ECCFG=\"PlmnSearchPowerLevel\",1", resp, 2000);
-    if (ret != ESP_OK) {
-        ret = SendAt("AT+ECCFG=PlmnSearchPowerLevel,1", resp, 2000);
-    }
-    if (ret == ESP_OK) {
-        application_managed_plmn_search_ = false;
-        return true;
-    }
-    ESP_LOGE(kTag, "Failed to restore modem-managed PLMN search");
-    return false;
-}
-
 void UartEthModem::SetDataLinkUp(bool up) {
+    if (!up) {
+        ip_ready_ = false;
+    }
     const bool previous = data_link_up_.exchange(up);
     if (previous == up || !mediator_) {
         return;
@@ -546,11 +525,9 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
 
     ConfigurePdp();
 
-    // Configure this before waiting for service. Older module revisions may
-    // reject ECCFG; in that case their default level-1 periodic search remains
-    // untouched and the application must not schedule ECPLMNS.
-    ConfigureApplicationManagedPlmnSearch();
-
+    // Keep the modem's built-in PLMN search policy. Product-level recovery may
+    // perform a low-frequency CFUN=0/1 cycle after the module has exhausted
+    // its own initial searches; it must not depend on optional ECPLMNS/ECCFG.
     // Set modem sleep parameters while the AT control plane is available.
     ret = SendAt("AT+ECSCLKEX=1," + std::to_string(kModemSleepTimeoutS) + ",30", resp, 1000);
     if (ret != ESP_OK) {
@@ -560,8 +537,8 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
     }
 
     // Registration has no component-owned timeout. CEREG URCs drive the
-    // persistent control task, and the top-level policy decides when ECPLMNS
-    // should be retried.
+    // persistent control task, and the top-level policy decides when a CFUN
+    // registration restart should be retried.
     SendAt("AT+CEREG=2", resp);
     SetNetworkEvent(UartEthModemEvent::Connecting);
     GetCellInfo();
@@ -630,4 +607,3 @@ void UartEthModem::QueryModemInfo() {
     GetImsi();
     ESP_LOGD(kTag, "Modem Info - IMEI: %s, ICCID: %s, Rev: %s", imei_.c_str(), iccid_.c_str(), module_revision_.c_str());
 }
-

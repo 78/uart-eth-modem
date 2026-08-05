@@ -166,7 +166,7 @@ esp_err_t UartEthModem::InitIotEth() {
 
     // Finish low-level setup, but keep the link down until registration and
     // ECNETDEVCTL/handshake are ready. This lets the AT control plane remain
-    // alive while the application backs off PLMN searches.
+    // alive while the modem searches or the application backs off CFUN retries.
     if (mediator_) {
         mediator_->on_stage_changed(mediator_, IOT_ETH_STAGE_LL_INIT, nullptr);
     }
@@ -317,11 +317,13 @@ void UartEthModem::IpEventHandler(void* arg, esp_event_base_t event_base,
     
     if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
         // Network is ready now
+        self->ip_ready_ = true;
         self->SetNetworkEvent(UartEthModemEvent::Connected);
         if (self->event_group_) {
             xEventGroupSetBits(self->event_group_, kEventNetworkReady);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_LOST_IP) {
+        self->ip_ready_ = false;
         self->SetDataLinkUp(false);
         self->SetNetworkEvent(UartEthModemEvent::RegistrationLost,
                               "cellular interface lost IP");
