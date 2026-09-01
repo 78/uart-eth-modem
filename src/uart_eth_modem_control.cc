@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include <esp_check.h>
 #include <esp_log.h>
@@ -18,15 +19,65 @@
 
 namespace {
 
-bool ParseCeregModeAndStatus(const std::string& response, int* mode, int* status) {
-    size_t pos = 0;
-    while ((pos = response.find("+CEREG:", pos)) != std::string::npos) {
-        if (sscanf(response.c_str() + pos, "+CEREG: %d,%d", mode, status) == 2) {
-            return true;
-        }
-        pos += sizeof("+CEREG:") - 1;
+enum class CeregParseResult {
+    NotFound,
+    StatusOnly,
+    Complete,
+};
+
+CeregParseResult ParseCeregResponse(const std::string& response,
+                                    UartEthModem::CellInfo* cell_info,
+                                    int* mode = nullptr) {
+    if (!cell_info) return CeregParseResult::NotFound;
+
+    const auto pos = response.find("+CEREG:");
+    if (pos == std::string::npos) return CeregParseResult::NotFound;
+
+    int parsed_mode = -1;
+    int stat = 0;
+    int act = 0;
+    char tac[16] = {0};
+    char ci[16] = {0};
+    const char* cereg = response.c_str() + pos;
+    if (sscanf(cereg, "+CEREG: %d,%d,\"%15[^\"]\",\"%15[^\"]\",%d",
+               &parsed_mode, &stat, tac, ci, &act) == 5) {
+        cell_info->stat = stat;
+        cell_info->tac = tac;
+        cell_info->ci = ci;
+        cell_info->act = act;
+        if (mode) *mode = parsed_mode;
+        return CeregParseResult::Complete;
     }
-    return false;
+    if (sscanf(cereg, "+CEREG: %d,\"%15[^\"]\",\"%15[^\"]\",%d",
+               &stat, tac, ci, &act) == 4) {
+        cell_info->stat = stat;
+        cell_info->tac = tac;
+        cell_info->ci = ci;
+        cell_info->act = act;
+        return CeregParseResult::Complete;
+    }
+    if (sscanf(cereg, "+CEREG: %d,%d", &parsed_mode, &stat) == 2) {
+        cell_info->stat = stat;
+        if (mode) *mode = parsed_mode;
+        return CeregParseResult::StatusOnly;
+    }
+    if (sscanf(cereg, "+CEREG: %d", &stat) == 1) {
+        cell_info->stat = stat;
+        return CeregParseResult::StatusOnly;
+    }
+    return CeregParseResult::NotFound;
+}
+
+bool ParseCeregModeAndStatus(const std::string& response, int* mode, int* status) {
+    if (!mode || !status) return false;
+    UartEthModem::CellInfo cell_info;
+    int parsed_mode = -1;
+    const CeregParseResult result =
+        ParseCeregResponse(response, &cell_info, &parsed_mode);
+    if (result == CeregParseResult::NotFound || parsed_mode < 0) return false;
+    *mode = parsed_mode;
+    *status = cell_info.stat;
+    return true;
 }
 
 bool ParseNetdevState(const std::string& response, int* state) {
@@ -177,36 +228,14 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
         return;
     }
 
-    // Parse CEREG following at_modem.cc logic
-    auto cereg_pos = response.find("+CEREG:");
-    if (cereg_pos != std::string::npos) {
+    // Parse solicited and unsolicited CEREG through the same helper used by
+    // QueryCellInfo(), so modem response formats have one source of truth.
+    CellInfo parsed_cell_info = cell_info_;
+    const CeregParseResult cereg_result =
+        ParseCeregResponse(response, &parsed_cell_info);
+    if (cereg_result != CeregParseResult::NotFound) {
         const int previous_stat = cell_info_.stat;
-        int n = 0, stat = 0;
-        char tac[16] = {0}, ci[16] = {0};
-        int act = 0;
-        
-        // Try format 1: +CEREG: n,stat,"tac","ci",act (with n parameter)
-        if (sscanf(response.c_str() + cereg_pos, "+CEREG: %d,%d,\"%15[^\"]\",\"%15[^\"]\",%d", &n, &stat, tac, ci, &act) == 5) {
-            cell_info_.stat = stat;
-            cell_info_.tac = tac;
-            cell_info_.ci = ci;
-            cell_info_.act = act;
-        }
-        // Try format 2: +CEREG: stat,"tac","ci",act (without n parameter)
-        else if (sscanf(response.c_str() + cereg_pos, "+CEREG: %d,\"%15[^\"]\",\"%15[^\"]\",%d", &stat, tac, ci, &act) == 4) {
-            cell_info_.stat = stat;
-            cell_info_.tac = tac;
-            cell_info_.ci = ci;
-            cell_info_.act = act;
-        }
-        // Try format 3: +CEREG: n,stat (unsolicited with n)
-        else if (sscanf(response.c_str() + cereg_pos, "+CEREG: %d,%d", &n, &stat) == 2) {
-            cell_info_.stat = stat;
-        }
-        // Try format 4: +CEREG: stat (query response)
-        else if (sscanf(response.c_str() + cereg_pos, "+CEREG: %d", &stat) == 1) {
-            cell_info_.stat = stat;
-        }
+        cell_info_ = std::move(parsed_cell_info);
 
         // Registration and IP readiness are separate. CEREG=2 means service
         // registration is searching, so report Connecting immediately even
@@ -263,6 +292,18 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
             }
         }
     }
+}
+
+UartEthModem::CellInfoResult UartEthModem::QueryCellInfo() {
+    std::string response;
+    const esp_err_t err = SendAt("AT+CEREG?", response);
+    if (err != ESP_OK) return std::unexpected(err);
+
+    CellInfo fresh_cell_info;
+    if (ParseCeregResponse(response, &fresh_cell_info) != CeregParseResult::Complete) {
+        return std::unexpected(ESP_ERR_INVALID_RESPONSE);
+    }
+    return fresh_cell_info;
 }
 
 UartEthModem::DataPathDiagnosticResult UartEthModem::DiagnoseDataPath() {
@@ -632,7 +673,11 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
     // registration restart should be retried.
     SendAt("AT+CEREG=2", resp);
     SetNetworkEvent(UartEthModemEvent::Connecting);
-    GetCellInfo();
+    const CellInfoResult initial_cell_info = QueryCellInfo();
+    if (!initial_cell_info) {
+        ESP_LOGD(kTag, "Initial CEREG query did not return complete cell info: %s",
+                 esp_err_to_name(initial_cell_info.error()));
+    }
 
     ESP_LOGI(kTag, "Modem control plane initialized; waiting for registration");
     return ESP_OK;

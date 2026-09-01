@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -97,6 +98,7 @@ public:
         std::string ci;
         int act = 0;
     };
+    using CellInfoResult = std::expected<CellInfo, esp_err_t>;
 
     enum class DataPathDiagnosticStatus {
         Healthy,
@@ -230,7 +232,14 @@ public:
     std::string GetCarrierName();
     std::string GetModuleRevision();
     int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
-    CellInfo GetCellInfo();
+    /**
+     * @brief Query a fresh, complete CEREG cell record.
+     *
+     * This never falls back to the previously cached cell. It succeeds only
+     * when this AT+CEREG? response contains stat, TAC, cell ID and access
+     * technology.
+     */
+    [[nodiscard]] CellInfoResult QueryCellInfo();
     /**
      * @brief Actively verify the AT control plane, CEREG configuration and
      *        cellular Ethernet data-device state.

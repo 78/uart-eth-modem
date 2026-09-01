@@ -517,15 +517,6 @@ int UartEthModem::GetSignalStrength() {
     return signal_strength_;
 }
 
-UartEthModem::CellInfo UartEthModem::GetCellInfo() {
-    std::string resp;
-    // HandleAtResponse() parses the received frame before it wakes SendAt(),
-    // so parsing the returned copy again would duplicate both state handling
-    // and debug output.
-    SendAt("AT+CEREG?", resp);
-    return cell_info_;
-}
-
 esp_err_t UartEthModem::RestartRegistration() {
     if (!initialized_.load() || start_mode_ != StartMode::kNormal ||
         stop_flag_.load() || data_activation_blocked_.load()) {

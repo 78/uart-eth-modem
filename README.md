@@ -97,6 +97,10 @@ AT+CFUN=0
 
 ## 变更日志 (Changelog)
 
+### [0.6.5] - 2026-09-01
+- 新增返回 `std::expected<CellInfo, esp_err_t>` 的 `QueryCellInfo()`；仅在本次 `AT+CEREG?` 返回完整 `stat` / `TAC` / `Cell ID` / `AcT` 时成功，不回退到旧缓存，并保留 AT 失败或响应无效的具体错误。
+- 主动查询、注册状态事件和数据路径诊断共用同一套 CEREG 解析，避免不同调用路径对模组响应格式产生偏差。
+
 ### [0.6.4] - 2026-09-01
 - 正常联网后收到 `ECRDY` 时发布 `ModemReset`，使上层可以拆除失效的数据面并重新执行完整初始化；修复同一驱动对象 `Stop()` 后再次 `Start()` 时残留停止事件导致新任务立即退出的问题。
 - 新增 `DiagnoseDataPath()`，主动检查 AT 控制通道、`CEREG` 上报模式/注册状态和 `ECNETDEVCTL` 数据设备状态，供上层在可能丢失复位 URC 时决定是否完整重初始化；`ECNETDEVCTL` 按最后一个状态字段精确解析。
