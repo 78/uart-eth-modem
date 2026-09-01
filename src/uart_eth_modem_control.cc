@@ -16,6 +16,27 @@
 #include <lwip/dns.h>
 #include <lwip/tcpip.h>
 
+namespace {
+
+bool ParseCeregModeAndStatus(const std::string& response, int* mode, int* status) {
+    size_t pos = 0;
+    while ((pos = response.find("+CEREG:", pos)) != std::string::npos) {
+        if (sscanf(response.c_str() + pos, "+CEREG: %d,%d", mode, status) == 2) {
+            return true;
+        }
+        pos += sizeof("+CEREG:") - 1;
+    }
+    return false;
+}
+
+bool ParseNetdevState(const std::string& response, int* state) {
+    const auto pos = response.find("+ECNETDEVCTL:");
+    return pos != std::string::npos &&
+           sscanf(response.c_str() + pos, "+ECNETDEVCTL: %*d,%*d,%*d,%d", state) == 1;
+}
+
+}  // namespace
+
 
 void UartEthModem::InitTaskRun() {
     ESP_LOGD(kTag, "Init task started");
@@ -132,6 +153,30 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
         ESP_LOGI(kTag, "AT<<< %s", response.c_str());
     }
 
+    // ECRDY is emitted after the module has rebooted. It is expected during
+    // initialization sequences that deliberately send ECRST, but after a
+    // completed start it means all volatile modem configuration and the data
+    // device have been reset underneath the MCU. Surface a dedicated event so
+    // the owner can tear down the stale netif and run the full init sequence.
+    if (response.find("ECRDY") != std::string::npos &&
+        start_mode_ == StartMode::kNormal && initialized_.load() &&
+        !initializing_.load()) {
+        ESP_LOGW(kTag, "Unexpected modem reset detected (ECRDY)");
+        initialized_ = false;
+        handshake_done_ = false;
+        ip_ready_ = false;
+        cell_info_ = {};
+        if (event_group_) {
+            xEventGroupClearBits(event_group_,
+                                 kEventHandshakeDone | kEventNetworkReady |
+                                     kEventRegistrationReady);
+        }
+        SetDataLinkUp(false);
+        SetNetworkEvent(UartEthModemEvent::ModemReset,
+                        "modem emitted ECRDY after initialization");
+        return;
+    }
+
     // Parse CEREG following at_modem.cc logic
     auto cereg_pos = response.find("+CEREG:");
     if (cereg_pos != std::string::npos) {
@@ -200,23 +245,69 @@ void UartEthModem::ParseAtResponse(const std::string& response) {
                                 ? "cellular not registered and not searching"
                                 : "cellular registration state unknown");
         }
-    } else if (response.find("+ECNETDEVCTL: 1") != std::string::npos) {
-        // Network device ready (link up)
-    } else if (response.find("+ECNETDEVCTL: 0") != std::string::npos) {
-        const bool was_data_ready = handshake_done_ || data_link_up_.load();
-        handshake_done_ = false;
-        SetDataLinkUp(false);
-        // ECNETDEVCTL? legitimately returns 0 before the first activation; it
-        // is not an OOS transition. Only report a loss after the data plane
-        // had previously completed its handshake or raised link.
-        if (was_data_ready) {
-            SetNetworkEvent(UartEthModemEvent::RegistrationLost,
-                            "cellular data device down");
-        }
-        if ((cell_info_.stat == 1 || cell_info_.stat == 5) && event_group_) {
-            xEventGroupSetBits(event_group_, kEventRegistrationReady);
+    } else {
+        int netdev_state = -1;
+        if (ParseNetdevState(response, &netdev_state) && netdev_state != 1) {
+            const bool was_data_ready = handshake_done_ || data_link_up_.load();
+            handshake_done_ = false;
+            SetDataLinkUp(false);
+            // ECNETDEVCTL? legitimately reports a stopped data device before
+            // first activation. Only report a loss after the data plane had
+            // previously completed its handshake or raised link.
+            if (was_data_ready) {
+                SetNetworkEvent(UartEthModemEvent::RegistrationLost,
+                                "cellular data device down");
+            }
+            if ((cell_info_.stat == 1 || cell_info_.stat == 5) && event_group_) {
+                xEventGroupSetBits(event_group_, kEventRegistrationReady);
+            }
         }
     }
+}
+
+UartEthModem::DataPathDiagnosticResult UartEthModem::DiagnoseDataPath() {
+    DataPathDiagnosticResult result;
+    std::string response;
+
+    if (SendAt("AT", response, 1000) != ESP_OK) {
+        result.detail = "AT control channel did not respond";
+        return result;
+    }
+
+    response.clear();
+    if (SendAt("AT+CEREG?", response, 1000) != ESP_OK ||
+        !ParseCeregModeAndStatus(response, &result.cereg_mode, &result.cereg_stat)) {
+        result.status = DataPathDiagnosticStatus::NeedsReinitialization;
+        result.detail = "CEREG query failed or returned an invalid response";
+        return result;
+    }
+
+    response.clear();
+    const bool netdev_valid =
+        SendAt("AT+ECNETDEVCTL?", response, 1000) == ESP_OK &&
+        ParseNetdevState(response, &result.netdev_state);
+
+    if (result.cereg_mode != 2) {
+        result.status = DataPathDiagnosticStatus::NeedsReinitialization;
+        result.detail = "CEREG URC mode is not 2";
+    } else if (result.cereg_stat != 1 && result.cereg_stat != 5) {
+        result.status = DataPathDiagnosticStatus::RegistrationUnavailable;
+        result.detail = "cellular service is not registered";
+    } else if (!netdev_valid) {
+        result.status = DataPathDiagnosticStatus::NeedsReinitialization;
+        result.detail = "ECNETDEVCTL query failed or returned an invalid response";
+    } else if (result.netdev_state != 1) {
+        result.status = DataPathDiagnosticStatus::NeedsReinitialization;
+        result.detail = "cellular data device is not running";
+    } else {
+        result.status = DataPathDiagnosticStatus::Healthy;
+        result.detail = "cellular control and data state are healthy";
+    }
+
+    ESP_LOGI(kTag, "Data-path diagnostic: status=%d CEREG=%d,%d ECNETDEVCTL=%d (%s)",
+             static_cast<int>(result.status), result.cereg_mode, result.cereg_stat,
+             result.netdev_state, result.detail.c_str());
+    return result;
 }
 
 esp_err_t UartEthModem::AtDetect() {
@@ -323,7 +414,7 @@ esp_err_t UartEthModem::ActivateDataNetwork() {
     if (activation_cancelled()) {
         return ESP_ERR_INVALID_STATE;
     }
-    sscanf(resp.c_str(), "\r\n+ECNETDEVCTL: %*d,%*d,%*d,%d", &state);
+    ParseNetdevState(resp, &state);
 
     if (state == 1) {
         ESP_LOGI(kTag, "Network device already started");

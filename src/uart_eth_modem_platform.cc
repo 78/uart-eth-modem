@@ -325,6 +325,14 @@ void UartEthModem::IpEventHandler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_LOST_IP) {
         self->ip_ready_ = false;
         self->SetDataLinkUp(false);
+        // Link-down during Stop(), Start(), or ECRDY recovery belongs to the
+        // netif being torn down. Reporting it later as RegistrationLost can
+        // race the replacement initialization and incorrectly demote its
+        // Connecting state. The reset path already publishes ModemReset.
+        if (!self->initialized_.load() || self->initializing_.load() ||
+            self->stop_flag_.load()) {
+            return;
+        }
         self->SetNetworkEvent(UartEthModemEvent::RegistrationLost,
                               "cellular interface lost IP");
         if ((self->cell_info_.stat == 1 || self->cell_info_.stat == 5) && self->event_group_) {

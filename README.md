@@ -97,7 +97,9 @@ AT+CFUN=0
 
 ## 变更日志 (Changelog)
 
-### Unreleased
+### [0.6.4] - 2026-09-01
+- 正常联网后收到 `ECRDY` 时发布 `ModemReset`，使上层可以拆除失效的数据面并重新执行完整初始化；修复同一驱动对象 `Stop()` 后再次 `Start()` 时残留停止事件导致新任务立即退出的问题。
+- 新增 `DiagnoseDataPath()`，主动检查 AT 控制通道、`CEREG` 上报模式/注册状态和 `ECNETDEVCTL` 数据设备状态，供上层在可能丢失复位 URC 时决定是否完整重初始化；`ECNETDEVCTL` 按最后一个状态字段精确解析。
 - OOS 恢复改为保留模组默认搜网，并新增 `RestartRegistration()` 供上层使用 `CFUN=0/1` 低频重启注册；普通初始化不再开启 `PlmnSearchPowerLevel=3`。
 - 将单一实现文件按生命周期、平台、传输和模组控制职责拆分，保持公开接口与运行行为不变，便于按日志模块定位问题。
 - `CEREG=2` 通过 `Connecting` 报告搜网，`CEREG=0/4` 即使从未成功注册也通过 `RegistrationLost` 报告不可用；0.6.2 的 `RequestPlmnSearch()` 与 `IsApplicationManagedPlmnSearchEnabled()` 仅保留源码兼容，固件不再发送 `ECPLMNS`。

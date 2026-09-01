@@ -77,6 +77,7 @@ public:
         Connecting,              // Network is connecting/searching (LinkUp, Searching)
         Connected,               // Network connected successfully (Ready, got IP address)
         Disconnected,            // Network disconnected (LinkDown)
+        ModemReset,              // ECRDY received after init: module restarted unexpectedly
         InFlightMode,            // Flight mode initialized (modem/SIM info available, no network)
         RfTestReady,             // RF lab test mode initialized
         ErrorNoSim,              // No SIM card detected
@@ -95,6 +96,21 @@ public:
         std::string tac;
         std::string ci;
         int act = 0;
+    };
+
+    enum class DataPathDiagnosticStatus {
+        Healthy,
+        RegistrationUnavailable,
+        NeedsReinitialization,
+        ControlUnavailable,
+    };
+
+    struct DataPathDiagnosticResult {
+        DataPathDiagnosticStatus status = DataPathDiagnosticStatus::ControlUnavailable;
+        int cereg_mode = -1;
+        int cereg_stat = -1;
+        int netdev_state = -1;
+        std::string detail;
     };
 
     enum class StartMode {
@@ -215,6 +231,14 @@ public:
     std::string GetModuleRevision();
     int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
     CellInfo GetCellInfo();
+    /**
+     * @brief Actively verify the AT control plane, CEREG configuration and
+     *        cellular Ethernet data-device state.
+     *
+     * This is intended for a user-triggered retry path where passive URCs may
+     * have been lost. It does not change modem configuration by itself.
+     */
+    DataPathDiagnosticResult DiagnoseDataPath();
     /**
      * @brief Restart cellular registration with AT+CFUN=0 / AT+CFUN=1.
      *

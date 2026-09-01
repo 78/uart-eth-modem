@@ -110,7 +110,18 @@ esp_err_t UartEthModem::Start(StartMode mode) {
     data_link_up_ = false;
     ip_ready_ = false;
     data_activation_blocked_ = false;
-    xEventGroupClearBits(event_group_, kEventDataActivationBlocked);
+    // Stop() leaves wake-up bits set so every task can observe shutdown. A
+    // UartEthModem instance is intentionally restartable (for example after
+    // the module emits ECRDY), so clear all per-run bits before creating the
+    // replacement tasks. Keeping kEventStop set would make TX and the control
+    // task terminate immediately after an otherwise successful restart.
+    xEventGroupClearBits(
+        event_group_,
+        kEventStart | kEventHandshakeDone | kEventStop | kEventNetworkReady |
+            kEventAtResponse | kEventInitDone | kEventNetworkEventChanged |
+            kEventSrdyHigh | kEventMainTaskDone | kEventInitTaskDone |
+            kEventActiveState | kEventTxTaskDone | kEventRegistrationReady |
+            kEventDataActivationBlocked);
 
     // Create event queue FIRST (before GPIO init, since ISR uses it)
     event_queue_ = xQueueCreate(32, sizeof(Event));
@@ -568,6 +579,7 @@ const char* UartEthModem::GetNetworkEventName(UartEthModemEvent event) {
         case UartEthModemEvent::Connecting: return "Connecting";
         case UartEthModemEvent::Connected: return "Connected";
         case UartEthModemEvent::Disconnected: return "Disconnected";
+        case UartEthModemEvent::ModemReset: return "ModemReset";
         case UartEthModemEvent::InFlightMode: return "InFlightMode";
         case UartEthModemEvent::RfTestReady: return "RfTestReady";
         case UartEthModemEvent::ErrorNoSim: return "ErrorNoSim";
