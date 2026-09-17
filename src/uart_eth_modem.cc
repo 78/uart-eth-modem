@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "uart_eth_modem.h"
+#include "uart_eth_memory.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +34,8 @@ UartEthModem::UartEthModem(const Config& config) : config_(config) {
         ESP_LOGE(kTag, "Failed to create event group");
         abort();  // Constructor cannot fail gracefully
     }
+
+    xEventGroupSetBits(event_group_, kEventShutdownComplete);
 
     // Initialize driver structure
     driver_.name = "uart_eth";
@@ -80,7 +84,9 @@ UartEthModem::UartEthModem(const Config& config) : config_(config) {
 }
 
 UartEthModem::~UartEthModem() {
-    Stop();
+    // Owners must successfully Stop before releasing the object. A timeout
+    // cannot be followed by freeing storage still referenced by worker tasks.
+    ESP_ERROR_CHECK(Stop());
 
     // Cleanup resources created in constructor
     if (event_group_) {
@@ -98,11 +104,14 @@ esp_err_t UartEthModem::Start(StartMode mode) {
     }
     ESP_LOGI(kTag, "Starting UartEthModem (%s mode)...", mode_name);
 
-    if (initialized_.load()) {
+    if (!IsStopped()) {
         ESP_LOGW(kTag, "Already started");
         return ESP_ERR_INVALID_STATE;
     }
 
+    main_task_ = nullptr;
+    init_task_ = nullptr;
+    tx_task_ = nullptr;
     start_mode_ = mode;
     stop_flag_ = false;
     handshake_done_ = false;
@@ -121,54 +130,66 @@ esp_err_t UartEthModem::Start(StartMode mode) {
             kEventAtResponse | kEventInitDone | kEventNetworkEventChanged |
             kEventSrdyHigh | kEventMainTaskDone | kEventInitTaskDone |
             kEventActiveState | kEventTxTaskDone | kEventRegistrationReady |
-            kEventDataActivationBlocked);
+            kEventDataActivationBlocked | kEventShutdownComplete | kEventStopPublished | kEventAtReady);
 
     // Create event queue FIRST (before GPIO init, since ISR uses it)
     event_queue_ = xQueueCreate(32, sizeof(Event));
     if (!event_queue_) {
         ESP_LOGE(kTag, "Failed to create event queue");
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
         return ESP_ERR_NO_MEM;
     }
 
-    // Create TX queue for non-blocking transmit from LWIP
-    tx_queue_ = xQueueCreate(kTxQueueDepth, sizeof(TxFrame));
-    if (!tx_queue_) {
-        ESP_LOGE(kTag, "Failed to create TX queue");
+    esp_err_t ret = InitTxPool();
+    if (ret != ESP_OK) {
+        stop_flag_ = true;
+        DeinitTxPool();
         vQueueDelete(event_queue_);
         event_queue_ = nullptr;
-        return ESP_ERR_NO_MEM;
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
+        return ret;
     }
 
     // Initialize UART
-    esp_err_t ret = InitUart();
+    ret = InitUart();
     if (ret != ESP_OK) {
-        vQueueDelete(tx_queue_);
-        tx_queue_ = nullptr;
+        stop_flag_ = true;
+        DeinitTxPool();
         vQueueDelete(event_queue_);
         event_queue_ = nullptr;
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
         return ret;
     }
 
     // Initialize GPIO
     ret = InitGpio();
     if (ret != ESP_OK) {
+        DeinitGpio();
         DeinitUart();
-        vQueueDelete(tx_queue_);
-        tx_queue_ = nullptr;
+        stop_flag_ = true;
+        DeinitTxPool();
         vQueueDelete(event_queue_);
         event_queue_ = nullptr;
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
         return ret;
     }
 
     // Allocate frame reassembly buffer
-    reassembly_buffer_ = static_cast<uint8_t*>(heap_caps_malloc(kMaxFrameSize, MALLOC_CAP_INTERNAL));
+    reassembly_buffer_ = static_cast<uint8_t*>(uart_eth::memory::AllocateBuffer(kMaxFrameSize, config_.use_psram));
     if (!reassembly_buffer_) {
         ESP_LOGE(kTag, "Failed to allocate reassembly buffer");
-        vQueueDelete(tx_queue_);
-        tx_queue_ = nullptr;
-        vQueueDelete(event_queue_);
         DeinitGpio();
+        stop_flag_ = true;
+        DeinitTxPool();
+        vQueueDelete(event_queue_);
+        event_queue_ = nullptr;
         DeinitUart();
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
         return ESP_ERR_NO_MEM;
     }
     reassembly_size_ = 0;
@@ -187,13 +208,16 @@ esp_err_t UartEthModem::Start(StartMode mode) {
     ret = uart_uhci_.Init(uhci_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(kTag, "Failed to init UHCI: %s", esp_err_to_name(ret));
+        DeinitGpio();
         free(reassembly_buffer_);
         reassembly_buffer_ = nullptr;
-        vQueueDelete(tx_queue_);
-        tx_queue_ = nullptr;
+        stop_flag_ = true;
+        DeinitTxPool();
         vQueueDelete(event_queue_);
-        DeinitGpio();
+        event_queue_ = nullptr;
         DeinitUart();
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
         return ret;
     }
 
@@ -207,6 +231,13 @@ esp_err_t UartEthModem::Start(StartMode mode) {
         static_cast<UartEthModem*>(arg)->MainTaskRun();
         vTaskDelete(nullptr);
     }, "uart_eth_main", 4096, this, 10, &main_task_);
+    if (!main_task_) {
+        stop_flag_ = true;
+        CleanupResources(false);
+        initializing_ = false;
+        xEventGroupSetBits(event_group_, kEventShutdownComplete);
+        return ESP_ERR_NO_MEM;
+    }
     
     // Create init task
     xTaskCreate([](void* arg) {
@@ -222,93 +253,72 @@ esp_err_t UartEthModem::Start(StartMode mode) {
 
     if (!main_task_ || !init_task_ || !tx_task_) {
         ESP_LOGE(kTag, "Failed to create tasks");
-        stop_flag_ = true;
-        vTaskDelay(pdMS_TO_TICKS(100));
-        uart_uhci_.Deinit();
-        free(reassembly_buffer_);
-        reassembly_buffer_ = nullptr;
-        vQueueDelete(tx_queue_);
-        tx_queue_ = nullptr;
-        vQueueDelete(event_queue_);
-        DeinitGpio();
-        DeinitUart();
-        return ESP_ERR_NO_MEM;
+        // Missing tasks cannot publish done bits. Wake the init task's start
+        // wait and join every task that did start before freeing pool/queues.
+        EventBits_t missing = 0;
+        if (!main_task_) missing |= kEventMainTaskDone;
+        if (!init_task_) missing |= kEventInitTaskDone;
+        if (!tx_task_) missing |= kEventTxTaskDone;
+        xEventGroupSetBits(event_group_, missing);
+        const esp_err_t stopped = Stop();
+        return stopped == ESP_OK ? ESP_ERR_NO_MEM : stopped;
     }
 
     // Signal start (initialization continues asynchronously in InitTaskRun)
-    // Failure will be notified via event callback (ErrorInitFailed, ErrorNoSim, etc.)
-    // Caller should call Stop() after receiving failure event to cleanup resources
+    // Failures arrive asynchronously. ErrorNoSim retains the AT channel for
+    // recovery; call Stop only when the owner wants to release that channel.
     xEventGroupSetBits(event_group_, kEventStart);
 
     ESP_LOGI(kTag, "UartEthModem starting asynchronously...");
     return ESP_OK;
 }
 
-esp_err_t UartEthModem::Stop() {
-    // Check if there's anything to stop: event_queue_ is created in Start()
-    // and destroyed in CleanupResources(). If it exists, tasks may be running.
-    if (!event_queue_) {
-        return ESP_OK;
-    }
-
-    ESP_LOGI(kTag, "Stopping UartEthModem...");
-
-    PrepareForShutdown();
-    stop_flag_ = true;
+void UartEthModem::RequestStop() {
+    // Exactly one caller publishes wakeups. The cleanup task waits for the
+    // final published bit before deleting any queue touched here.
+    if (stop_flag_.exchange(true)) return;
+    initialized_ = false;
     initializing_ = false;
-    if (event_group_) {
-        xEventGroupSetBits(event_group_, kEventStop);
-    }
-
-    // Send Stop event to main task queue to wake it up from xQueueReceive
-    // (MainTask may be blocked on portMAX_DELAY in Idle state)
+    data_activation_blocked_ = true;
+    xEventGroupClearBits(event_group_, kEventAtReady);
+    xEventGroupSetBits(event_group_, kEventStop | kEventStart | kEventDataActivationBlocked);
     if (event_queue_) {
         Event event = {.type = EventType::Stop, .rx_buffer = nullptr};
         xQueueSend(event_queue_, &event, 0);
     }
-
-    // Send dummy frame to tx_queue to wake up TxTask from xQueueReceive
-    // (TxTask may be blocked on portMAX_DELAY waiting for frame)
     if (tx_queue_) {
-        TxFrame dummy_frame = {};
-        xQueueSend(tx_queue_, &dummy_frame, 0);
+        TxFrame* wakeup = nullptr;
+        xQueueSend(tx_queue_, &wakeup, 0);
     }
-
-    // Wait for every task to finish. Resource destruction while even one task
-    // is alive is unsafe: task epilogues publish their done bit through this
-    // event group. A partial non-zero mask must not be mistaken for all tasks.
-    if (event_group_) {
-        EventBits_t bits = 0;
-        do {
-            bits = xEventGroupWaitBits(event_group_, kEventAllTasksDone,
-                                       pdTRUE, pdTRUE, pdMS_TO_TICKS(10000));
-            if ((bits & kEventAllTasksDone) != kEventAllTasksDone) {
-                ESP_LOGE(kTag, "Still waiting for modem tasks, completed mask=0x%lx",
-                         static_cast<unsigned long>(bits & kEventAllTasksDone));
-            }
-        } while ((bits & kEventAllTasksDone) != kEventAllTasksDone);
-    }
-
-    // Cleanup all resources including iot_eth
-    CleanupResources(true);
-
-    initialized_ = false;
-
-    ESP_LOGI(kTag, "UartEthModem stopped");
-    return ESP_OK;
+    xEventGroupSetBits(event_group_, kEventStopPublished);
 }
 
-void UartEthModem::PrepareForShutdown() {
-    data_activation_blocked_ = true;
-    if (event_group_) {
-        xEventGroupClearBits(event_group_, kEventRegistrationReady);
-        xEventGroupSetBits(event_group_, kEventDataActivationBlocked);
+esp_err_t UartEthModem::Stop(uint32_t timeout_ms) {
+    if (IsStopped()) return ESP_OK;
+    const TaskHandle_t caller = xTaskGetCurrentTaskHandle();
+    if (caller == main_task_ || caller == init_task_ || caller == tx_task_) {
+        return ESP_ERR_INVALID_STATE;  // A callback cannot join its own task.
     }
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    RequestStop();
+    const int64_t remaining_us = deadline - esp_timer_get_time();
+    const TickType_t ticks = remaining_us > 0
+        ? static_cast<TickType_t>(std::min<uint64_t>(
+              (static_cast<uint64_t>(remaining_us) * configTICK_RATE_HZ) / 1000000,
+              portMAX_DELAY - 1)) : 0;
+    const EventBits_t bits = xEventGroupWaitBits(event_group_, kEventShutdownComplete,
+                                                pdFALSE, pdTRUE, ticks);
+    // Cleanup (including netif teardown and mutex acquisition) runs in the
+    // existing main worker, so none of those operations can overrun this wait.
+    return (bits & kEventShutdownComplete) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
 
-    // Setting the flag first prevents another activation from entering while
-    // this waits for an already-running activation to observe the event and
-    // leave. AT commands remain usable after the barrier is established.
-    std::lock_guard<std::mutex> lock(data_activation_mutex_);
+esp_err_t UartEthModem::PrepareForShutdown(uint32_t timeout_ms) {
+    data_activation_blocked_ = true;
+    xEventGroupClearBits(event_group_, kEventRegistrationReady);
+    xEventGroupSetBits(event_group_, kEventDataActivationBlocked);
+    std::unique_lock<std::timed_mutex> lock(data_activation_mutex_, std::defer_lock);
+    return lock.try_lock_for(std::chrono::milliseconds(timeout_ms)) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t UartEthModem::ExitRfTestMode() {
@@ -341,7 +351,10 @@ esp_err_t UartEthModem::ExitRfTestMode() {
 
 esp_err_t UartEthModem::SendAt(const std::string& cmd, std::string& response, uint32_t timeout_ms) {
     std::unique_lock<std::timed_mutex> lock(at_mutex_, std::defer_lock);
-    while (!lock.try_lock_for(std::chrono::milliseconds(50))) {
+    const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!lock.try_lock_until(std::min(lock_deadline,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(50)))) {
+        if (std::chrono::steady_clock::now() >= lock_deadline) return ESP_ERR_TIMEOUT;
         if (stop_flag_.load()) {
             return ESP_ERR_INVALID_STATE;
         }
@@ -352,8 +365,9 @@ esp_err_t UartEthModem::SendAt(const std::string& cmd, std::string& response, ui
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Allow AT commands during initialization even if not connected
-    if (!handshake_done_.load() && !initializing_.load() && !initialized_.load()) {
+    // AT detection runs during initialization; a missing SIM keeps the detected
+    // control channel available without claiming network initialization succeeded.
+    if (!IsAtReady() && !initializing_.load()) {
         ESP_LOGE(kTag, "Failed to send AT command: not initialized");
         return ESP_ERR_INVALID_STATE;
     }
@@ -383,7 +397,7 @@ esp_err_t UartEthModem::SendAt(const std::string& cmd, std::string& response, ui
     EventBits_t bits = xEventGroupWaitBits(
         event_group_,
         kEventAtResponse | kEventStop,
-        pdTRUE,   // Clear on exit
+        pdFALSE,  // Stop is latched until the next Start()
         pdFALSE,  // Wait for any bit
         pdMS_TO_TICKS(timeout_ms)
     );
@@ -526,7 +540,7 @@ esp_err_t UartEthModem::RestartRegistration() {
     // Keep CFUN changes from racing ECNETDEVCTL activation after a late CEREG
     // URC. SendAt() supplies AT-channel serialization; this mutex covers the
     // larger registration/data-plane transition.
-    std::lock_guard<std::mutex> activation_lock(data_activation_mutex_);
+    std::lock_guard<std::timed_mutex> activation_lock(data_activation_mutex_);
     if (stop_flag_.load() || data_activation_blocked_.load()) {
         return ESP_ERR_INVALID_STATE;
     }

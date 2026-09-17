@@ -4,6 +4,7 @@ idf_component_register(
         "src/uart_eth_modem_control.cc"
         "src/uart_eth_modem_platform.cc"
         "src/uart_eth_modem_transport.cc"
+        "src/uart_eth_tx_pool.cc"
     INCLUDE_DIRS
         "include"
     REQUIRES

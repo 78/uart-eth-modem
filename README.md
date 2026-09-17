@@ -95,42 +95,9 @@ AT+CFUN=0
 
 该退出流程用于恢复正常 SIM 卡模式、重启模组使配置生效，并将模组切回 `AT+CFUN=0`，避免 RF 测试结束后继续保持全功能态。
 
-## 变更日志 (Changelog)
+## 变更日志
 
-### [0.6.5] - 2026-09-01
-- 新增返回 `std::expected<CellInfo, esp_err_t>` 的 `QueryCellInfo()`；仅在本次 `AT+CEREG?` 返回完整 `stat` / `TAC` / `Cell ID` / `AcT` 时成功，不回退到旧缓存，并保留 AT 失败或响应无效的具体错误。
-- 主动查询、注册状态事件和数据路径诊断共用同一套 CEREG 解析，避免不同调用路径对模组响应格式产生偏差。
-
-### [0.6.4] - 2026-09-01
-- 正常联网后收到 `ECRDY` 时发布 `ModemReset`，使上层可以拆除失效的数据面并重新执行完整初始化；修复同一驱动对象 `Stop()` 后再次 `Start()` 时残留停止事件导致新任务立即退出的问题。
-- 新增 `DiagnoseDataPath()`，主动检查 AT 控制通道、`CEREG` 上报模式/注册状态和 `ECNETDEVCTL` 数据设备状态，供上层在可能丢失复位 URC 时决定是否完整重初始化；`ECNETDEVCTL` 按最后一个状态字段精确解析。
-- OOS 恢复改为保留模组默认搜网，并新增 `RestartRegistration()` 供上层使用 `CFUN=0/1` 低频重启注册；普通初始化不再开启 `PlmnSearchPowerLevel=3`。
-- 将单一实现文件按生命周期、平台、传输和模组控制职责拆分，保持公开接口与运行行为不变，便于按日志模块定位问题。
-- `CEREG=2` 通过 `Connecting` 报告搜网，`CEREG=0/4` 即使从未成功注册也通过 `RegistrationLost` 报告不可用；0.6.2 的 `RequestPlmnSearch()` 与 `IsApplicationManagedPlmnSearchEnabled()` 仅保留源码兼容，固件不再发送 `ECPLMNS`。
-- 注册恢复后保持 AT 控制任务存活，延后启动数据设备和 Ethernet link，取得 IP 后才发布 `Connected`。
-- `Stop()` 等待全部任务退出，AT mutex 等待可响应停止标志，避免快速 Wi-Fi / 4G 切换时释放仍被任务使用的资源。
-
-### [0.6.0] - 2026-06-28
-- **接口变更**: `Start(bool flight_mode)` 替换为 `Start(StartMode mode = StartMode::kNormal)`，非默认模式需显式选择启动模式。
-- 新增 `StartMode::kRfTest` 和 `RfTestReady` 事件，用于 RF 实验室测试模式。
-- RF 测试模式执行 `AT+ECSIMCFG="SimSimulator",1`、`AT+ECRST`、`AT+CFUN=1` 后保持 AT 传输层，不安装 `iot_eth`，也不发送普通联网初始化指令。
-- 新增 `ExitRfTestMode()`，退出 RF 测试模式时恢复正常 SIM 卡模式、重启模组并发送 `AT+CFUN=0`。
-
-### [0.5.0] - 2026-06-07
-- **接口变更**: `SetNetworkEventCallback` 的回调签名由 `void(UartEthModemEvent)` 调整为 `void(UartEthModemEvent, const std::string& detail)`。
-- `ErrorInitFailed` 等错误事件现在携带具体失败原因（如 `Modem not detected`、`Network registration timeout`、`Handshake timeout` 等），上层无需查看串口日志即可定位失败步骤。
-
-### [0.4.0] - 2026-04-28
-- 新增 `SetPdpContext(apn, pdp_type)` API，允许上层注入 APN 和 PDP 类型；为空时沿用模组默认配置。
-- 新增 `GetImsi()` 接口（`AT+CIMI`）。
-- 新增 `RequestingPdpContext` 事件：在配置 PDP 之前发出，便于同步回调场景下回填 APN；异步派发的客户端仍需在 `Start()` 之前调用 `SetPdpContext`。
-- 优化首次启动流程：波特率切换和 NAT 配置合并到同一次 `AT+ECRST`，缩短开机时长。
-- `RunNormalModeInitSequence` 调整为先检查 NAT/baud，再统一进入 `CFUN=1`，去掉冗余的二次进入全功能态。
-
-### [0.1.0] - 2026-01-19
-- 初始版本：从项目 `main/hardware/network` 迁移为独立组件。
-
-> 0.1.1 ~ 0.3.5 的中间版本以增量优化为主（飞行模式、ISR 安全性、DMA 缓冲、DNS 缓存管理等），详见 git log。
+版本变更与升级注意事项见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -146,6 +113,7 @@ AT+CFUN=0
 | `uart_eth_modem.cc` | 对象生命周期、公开 API、同步 AT 命令入口 |
 | `uart_eth_modem_platform.cc` | UART/GPIO、`iot_eth`/`esp_netif`、中断与资源清理 |
 | `uart_eth_modem_transport.cc` | TX/Main 任务、MRDY/SRDY 状态机、帧收发与重组 |
+| `uart_eth_tx_pool.{h,cc}` | 固定 TX 槽位、工作线程与等待者所有权；不依赖 RTOS 或 AT 协议 |
 | `uart_eth_modem_control.cc` | Init 任务、AT 响应解析、SIM/PDP/PLMN 与启动序列 |
 
 ### 1. 系统架构
@@ -158,8 +126,53 @@ AT+CFUN=0
 控制 RX DMA 启停和 MRDY/SRDY 信号，共四个状态：`Idle`、`PendingActive`、`Active`、`PendingIdle`。空闲超时 500ms 后从 `Active` 切到 `PendingIdle`，双方都空闲时进入 `Idle` 并释放 PM 锁。
 
 ### 3. UART 收发机制
-- **RX**：UHCI + GDMA 链表 + idle EOF 模式；所有缓冲区固定挂载，通过 GDMA owner 标志在 DMA/CPU 之间切换；上层处理完毕调用 `ReturnBuffer()` 归还。
+- **RX**：UHCI + GDMA 链表 + idle EOF；DMA owner 与消费者持有状态共同管理缓冲。ISR 入队失败时标记延后归还，MainTask 定期回收，停止时排空所有 RX 持有者后才释放 DMA 池。
 - **TX**：直接调用 `uart_ll_write_txfifo` 同步写入（FIFO 满时短延时重试），不占用 GDMA 通道；进入/退出时持/放 PM 锁。
+
+### 发送内存与超时
+
+发送池独立为 `UartEthTxPool`（`include/uart_eth_tx_pool.h`、`src/uart_eth_tx_pool.cc`），负责 `Acquire()`、`Complete()` 和 `ReleaseWaiter()`。它只保存固定槽位及工作线程/等待者各自的所有权；驱动负责整个池对象的内存分配、锁、队列、通知和协议封装。这个职责划分与 [MicroPixel PR #13](https://github.com/78/micropixel/pull/13) 的 `TxPool` 一致。
+
+驱动使用 `std::unique_ptr` 持有池对象，无状态自定义删除器负责析构并调用 `heap_caps_free()`；初始化中途失败时自动回收。编译期断言保证智能指针与裸指针大小一致。队列中的槽位指针仅为借用，不单独释放；正常停止仍先等待工作线程和同步等待者退出，再 `reset()` 池对象。
+
+实例配置示例（GPIO 等参数按板级配置补充）：
+
+```cpp
+UartEthModem::Config config;
+config.tx_queue_depth = 32;
+config.use_psram = true;
+auto modem = std::make_unique<UartEthModem>(config);
+```
+
+- `Config::tx_queue_depth` 默认 32，表示待发送队列深度；池容量为 `tx_queue_depth + 2`，额外槽位容纳正在发送和已完成但同步调用者尚未释放的帧。只在启动时分配，运行中不扩容。零值或会导致容量/字节数溢出的值使 `Start()` 返回 `ESP_ERR_INVALID_ARG`。
+- `Config::use_psram` 默认 `false`，不要求设备具有 PSRAM。设为 `true` 时 TX 池和 1600 字节重组工作区使用 `MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT`，否则使用 `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`。所选堆分配失败返回 `ESP_ERR_NO_MEM`，不跨堆回退；不存在组件级 PSRAM Kconfig 开关。实例创建时复制配置，后续 Stop/Start 沿用该配置。
+- 池元数据与槽位数组在同一次分配中，容量为 `sizeof(UartEthTxPool) + (tx_queue_depth + 2) × sizeof(Slot)`。每槽帧容量仍为 1600 字节。ESP32-S3 的默认池连同重组缓冲共需 56416 字节（未计分配器开销）；`use_psram=true` 时全部位于 PSRAM。队列本身只保存槽位指针，增大队列深度也会增加 FreeRTOS 队列的内部 SRAM 用量。
+- 此配置不改变 RX DMA、任务栈、同步对象和 AT 字符串的分配方式。RX DMA 缓冲仍位于内部 SRAM。
+- 每次发送不再创建数据缓冲或信号量。同步发送串行复用一个启动时创建的信号量；槽位状态由 `tx_mutex_` 保护，复用已有 `at_mutex_` 串行化 AT 和握手的同步等待者。
+- 队列/池满时，异步发送返回 `ESP_ERR_NO_MEM`；同步发送最多重试 100 ms。发送载荷超过 1596 字节返回 `ESP_ERR_INVALID_SIZE`，不负责自动拆帧。
+- 同步等待仍为 2 秒。超时只撤销等待者的持有权；发送任务仍持有槽位，完成后才允许复用。超时不表示该帧已取消发送。
+- 停止时 TX 任务取消排队帧，唤醒同步调用者；MainTask 等待 TX/控制任务退出及停止通知发布完毕，再清理 netif、缓冲池、GPIO 和 UART。本次没有增加 AT-only 模式，也没有改造 AT 字符串接口。
+
+主机回归：`python3 tests/run_host_tests.py`，使用生产方法与模拟 FreeRTOS 队列/信号量，并启用 ASan/UBSan。它不替代实机的吞吐、功耗与内部堆峰值验证。
+
+### 停止与对象所有权
+
+- `Stop()` 默认等待预算为 5000 ms，涵盖工作线程退出、AT/激活互斥锁和 netif 清理；耗时清理复用现有 MainTask，不新增任务或栈。
+- 返回 `ESP_OK` 才可以销毁对象或重启。`ESP_ERR_TIMEOUT` 表示停止已请求、清理尚未完成，必须保留对象；可调用 `Stop(0)` 非阻塞轮询，或再次 `Stop(ms)` 有限等待。`IsStopping()` / `IsStopped()` 用于查询状态。
+- 停止期间拒绝新发送和 `Start()`。Stop 位保持置位，直到下一次 Start 才清除，避免一个等待者消费取消通知后其他任务永久等待。不得从驱动自己的工作任务/直接事件回调中同步 Stop（返回 `ESP_ERR_INVALID_STATE`）；应调度给持有者处理。
+- 调用方串行执行 Start/销毁与其它生命周期操作。析构函数不能报告超时：最后一次 Stop 失败会触发 `ESP_ERROR_CHECK`，绝不释放仍被工作任务访问的对象。因此正常业务应先检查 Stop 结果，超时后保留并重试，不能直接 `reset()`。
+- `PrepareForShutdown(3000)` 在保持 AT 通道的同时阻止后续数据激活；互斥锁等待也有时限，失败返回 `ESP_ERR_TIMEOUT`，阻止激活的状态仍保留。它是板级优雅关闭前的独立步骤，CFUN/RF 退出命令时间不计入 Stop 的等待预算。
+- FIFO TX 总等待预算为 1000 ms，覆盖填充 FIFO 和末字节发完；停止标志可提前取消。失败复位残留 TX FIFO 并释放 PM 锁。
+
+停止回归：`python3 tests/run_stop_tests.py`；另可使用 `SANITIZERS=thread` 检查线程竞态。覆盖线程/清理阻塞、重复及并发 Stop、发布唤醒期间的资源保护、AT/激活锁超时、取消通知保持和安全重试。
+
+### 缺卡时默认保留 AT
+
+普通模式和飞行模式检测到 `+CME ERROR: 10`（缺卡），或重试后仍收到 SIM 未就绪的 `+CPIN` 回复时，默认保留已经检测成功的 AT 通道，无需配置开关或新启动模式。此时先设置状态，再报告 `ErrorNoSim`：`IsAtReady()` 为 true，`IsInitialized()` 为 false，`GetNetif()` 为 null。Init 任务退出，原有 RX/TX 任务继续处理查询和切卡命令，不配置 PDP、不创建网卡或启动数据激活。
+
+AT 波特率检测失败、SIM 查询通信超时/错误仍触发初始化失败清理；不能把无响应当作缺卡。停止会立即撤销 AT 就绪状态。`ErrorNoSim` 的接入方应保留驱动并将查询/切卡工作安排到自己的任务；如果它主动调用 Stop，通道仍会按请求关闭。
+
+切卡后需要成功 Stop 再 Start，或由板级策略重启整机，重新执行联网初始化。本次不自动检测插卡、不新增 `StartNetwork()`，也不改 AT 字符串的存储或长度限制。`iot_eth` 依赖保持 `^1.1.0`。
 
 ### 4. 帧协议格式
 4 字节自定义帧头 + 0~1596 字节载荷，单帧最大 `kMaxFrameSize = 1600` 字节：

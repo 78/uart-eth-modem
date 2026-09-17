@@ -13,6 +13,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "uart_uhci.h"
+#include "uart_eth_tx_pool.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -131,6 +132,8 @@ public:
         gpio_num_t srdy_pin = GPIO_NUM_NC;   // Slave Ready (RI, low=busy)
         size_t rx_buffer_count = 4;          // Number of DMA RX buffers
         size_t rx_buffer_size = 1600;        // Size of each DMA RX buffer
+        size_t tx_queue_depth = 32;         // Pending frames; pool adds two slots
+        bool use_psram = false;             // TX pool + reassembly; no heap fallback
     };
 
     // Callback types
@@ -158,6 +161,9 @@ public:
     * 5. Install iot_eth driver and create netif
     *
     * @param mode Start mode for the initialization sequence. Defaults to normal mode.
+    * Startup is asynchronous. A missing/unready SIM reports ErrorNoSim and
+    * leaves IsAtReady() true, IsInitialized() false, and GetNetif() null.
+    * After switching SIM, Stop/Start (or a board reboot) reruns network setup.
     * @return ESP_OK on success
     */
     esp_err_t Start(StartMode mode = StartMode::kNormal);
@@ -165,20 +171,33 @@ public:
     /**
     * @brief Stop the modem
     *
-    * This will stop all tasks and release resources.
+    * Cancels work and waits for background cleanup (default 5000 ms).
+    * Timeout includes worker joins, activation/AT locks and netif cleanup.
+    * On timeout retain the object; use Stop(0) to poll, or Stop(ms) to retry.
+    * Start is rejected until IsStopped(). Serialize Start/destruction with
+    * other lifecycle calls; never destroy after a failed Stop. The destructor
+    * fails fast if its final Stop fails, rather than freeing live workers.
     *
-    * @return ESP_OK on success
+    * @return ESP_OK once cleanup completes; ESP_ERR_TIMEOUT if still stopping;
+    * ESP_ERR_INVALID_STATE when called from one of this driver's worker tasks.
     */
-    esp_err_t Stop();
+    esp_err_t Stop(uint32_t timeout_ms = 5000);
+    bool IsStopping() const {
+        return stop_flag_.load() && !(xEventGroupGetBits(event_group_) & kEventShutdownComplete);
+    }
+    bool IsStopped() const {
+        return xEventGroupGetBits(event_group_) & kEventShutdownComplete;
+    }
 
     /**
      * @brief Prevent new cellular data-plane activation before graceful shutdown
      *
      * This keeps the AT control plane available for commands such as CFUN=0,
      * while waiting for any in-flight ECNETDEVCTL activation to leave its
-     * critical section. Stop() also applies this barrier automatically.
+     * critical section within timeout_ms. On timeout the barrier stays set.
+     * Stop() cancels work directly and joins this activity in background cleanup.
      */
-    void PrepareForShutdown();
+    esp_err_t PrepareForShutdown(uint32_t timeout_ms = 3000);
 
     /**
     * @brief Exit RF lab test mode
@@ -205,13 +224,19 @@ public:
      *
      * @return true if initialized, false otherwise
      */
-    bool IsInitialized() const { return initialized_.load(); }
+    bool IsInitialized() const { return initialized_.load() && !stop_flag_.load(); }
+    // AT availability is independent of SIM/network initialization. Missing SIM
+    // keeps this true until Stop; use SendAt for slot queries and SIM switching.
+    bool IsAtReady() const {
+        return (xEventGroupGetBits(event_group_) & kEventAtReady) && !stop_flag_.load();
+    }
 
     /**
      * @brief Set callback for network event changes
      * 
-     * This callback is only triggered when network is initialized.
-     * It reports network event changes.
+     * Reports startup failures and network changes, including ErrorNoSim while
+     * only the AT channel is available. Install before Start and enqueue any
+     * follow-up AT/lifecycle work to the owning task rather than blocking here.
      */
     void SetNetworkEventCallback(UartEthModemEventCallback callback);
 
@@ -354,13 +379,14 @@ private:
 
     static_assert(sizeof(FrameHeader) == 4, "FrameHeader must be 4 bytes");
 
-    // TX frame structure (for queue)
-    struct TxFrame {
-        uint8_t* data;               // Header + payload, allocated with malloc
-        size_t length;               // Total length including header
-        SemaphoreHandle_t done_sem;  // Optional: signaled when transmission completes (for sync send)
-        esp_err_t* result;           // Optional: pointer to store result (for sync send)
+    static constexpr size_t kMaxFrameSize = UartEthTxPool::kFrameSize;
+    using TxFrame = UartEthTxPool::Slot;
+    struct TxPoolDeleter {
+        void operator()(UartEthTxPool* pool) const noexcept;
     };
+    using TxPoolPtr = std::unique_ptr<UartEthTxPool, TxPoolDeleter>;
+    static_assert(sizeof(TxPoolPtr) == sizeof(UartEthTxPool*),
+                  "TX pool ownership must not add internal SRAM overhead");
 
     // Initialization and cleanup
     esp_err_t InitUart();
@@ -393,8 +419,14 @@ private:
     static bool IRAM_ATTR UhciRxCallbackStatic(const UartUhci::RxEventData& data, void* user_data);
 
     // Frame processing
+    // Caller holds at_mutex_: AT and handshake share one completion waiter.
     esp_err_t SendFrame(const uint8_t* data, size_t length, FrameType type);
     esp_err_t EnqueueTxFrame(const uint8_t* buf, size_t len);
+    esp_err_t InitTxPool();
+    void DeinitTxPool();
+    esp_err_t QueueTxFrame(const uint8_t* data, size_t length, FrameType type,
+                          bool synchronous, TxFrame** queued_frame);
+    void CompleteTxFrame(TxFrame* frame, esp_err_t result);
     void ProcessReceivedFrame(uint8_t* data, size_t size);
     void HandleEthFrame(uint8_t* data, size_t length);
     void HandleAtResponse(const char* data, size_t length);
@@ -410,7 +442,8 @@ private:
     esp_err_t RunFlightModeInitSequence();
     esp_err_t RunNormalModeInitSequence();
     esp_err_t RunRfTestModeInitSequence();
-    bool CheckSimCard();
+    // ESP_ERR_NOT_FOUND means SIM absent/not ready, not an AT transport failure.
+    esp_err_t CheckSimCard();
     bool WaitForRegistration(uint32_t timeout_ms);
     void QueryModemInfo();
     esp_err_t AtDetect();
@@ -432,6 +465,7 @@ private:
 
     // Resource cleanup
     void CleanupResources(bool cleanup_iot_eth = true);
+    void RequestStop();
 
     // IP event handler
     static void IpEventHandler(void* arg, esp_event_base_t event_base,
@@ -441,9 +475,6 @@ private:
     Config config_;
     int detect_baud_rate_ = 0;
 
-    // Network initialization flag (atomic for thread safety)
-    std::atomic<bool> initialized_{false};
-    
     // Network event (atomic for thread safety)
     std::atomic<UartEthModemEvent> network_event_{UartEthModemEvent::Disconnected};
 
@@ -453,7 +484,7 @@ private:
     // instead of holding modem destruction hostage indefinitely.
     std::timed_mutex at_mutex_;
     // Serializes ECNETDEVCTL activation against graceful modem shutdown.
-    std::mutex data_activation_mutex_;
+    std::timed_mutex data_activation_mutex_;
     EventGroupHandle_t event_group_ = nullptr;
 
     // UHCI DMA
@@ -461,7 +492,6 @@ private:
     
     // Frame reassembly buffer for incomplete frames
     // 用于不完整帧的重组缓冲区
-    static constexpr size_t kMaxFrameSize = 1600;
     uint8_t* reassembly_buffer_ = nullptr;
     size_t reassembly_size_ = 0;
     size_t reassembly_expected_ = 0;  // Expected total frame size (header + payload)
@@ -473,9 +503,14 @@ private:
 
     // TX queue for non-blocking transmit from LWIP
     QueueHandle_t tx_queue_ = nullptr;
-    static constexpr size_t kTxQueueDepth = 32;  // Max pending TX frames
+    TxPoolPtr tx_pool_;
+    std::mutex tx_mutex_;
+    SemaphoreHandle_t tx_done_ = nullptr;
 
     // State flags (atomic for thread safety)
+    // Group byte-sized flags to avoid padding growth from instance configuration.
+    std::atomic<bool> initialized_{false};
+    std::atomic<bool> mrdy_is_low_{false};
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> handshake_done_{false};
     std::atomic<bool> initializing_{false};
@@ -491,7 +526,6 @@ private:
 
     // Working state machine
     std::atomic<WorkingState> working_state_{WorkingState::Idle};
-    std::atomic<bool> mrdy_is_low_{false};
     int64_t last_activity_time_us_{0};
     static constexpr int64_t kIdleTimeoutMs = 500;
     static constexpr int64_t kAckTimeoutMs = 100;
@@ -538,12 +572,13 @@ private:
     static constexpr uint32_t kEventRegistrationReady = (1 << 13);
     static constexpr uint32_t kEventDataActivationBlocked = (1 << 14);
 
+    static constexpr uint32_t kEventShutdownComplete = (1 << 15);
+    static constexpr uint32_t kEventStopPublished = (1 << 16);
+    static constexpr uint32_t kEventAtReady = (1 << 17);
+
     static constexpr uint32_t kEventMainTaskDone = (1 << 8);
     static constexpr uint32_t kEventInitTaskDone = (1 << 10);
     static constexpr uint32_t kEventTxTaskDone = (1 << 12);
-
-    static constexpr uint32_t kEventAllTasksDone =
-            kEventMainTaskDone | kEventInitTaskDone | kEventTxTaskDone;
 
     // Timing constants
     static constexpr uint32_t kHandshakeTimeoutMs = 5000;

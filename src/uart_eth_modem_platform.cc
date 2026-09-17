@@ -348,7 +348,7 @@ void UartEthModem::CleanupResources(bool cleanup_iot_eth) {
     }
 
     // Stop the GPIO ISR before deleting any queue or event object it can
-    // reference. Tasks have already joined when Stop() calls this routine.
+    // reference. MainTask has joined TX/control tasks before calling here.
     DeinitGpio();
 
     // Cleanup UHCI controller
@@ -362,17 +362,8 @@ void UartEthModem::CleanupResources(bool cleanup_iot_eth) {
     reassembly_size_ = 0;
     reassembly_expected_ = 0;
 
-    // Cleanup TX queue (free any pending frames)
-    if (tx_queue_) {
-        TxFrame frame;
-        while (xQueueReceive(tx_queue_, &frame, 0) == pdTRUE) {
-            if (frame.data) {
-                free(frame.data);
-            }
-        }
-        vQueueDelete(tx_queue_);
-        tx_queue_ = nullptr;
-    }
+    // Complete queued sends and join their waiter before destroying the pool.
+    DeinitTxPool();
 
     // Cleanup event queue
     if (event_queue_) {

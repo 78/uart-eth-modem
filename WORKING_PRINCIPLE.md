@@ -95,7 +95,7 @@ graph TB
 - **InitTask**：异步执行 AT 启动序列、握手与 `iot_eth` 安装。
 - **TxTask**：串行化所有帧发送（AT、握手、Ethernet），消除 LWIP 阻塞。
 - **事件队列**（`event_queue_`，深度 32）：连接 ISR、TxTask 与 MainTask。
-- **TX 队列**（`tx_queue_`，深度 `kTxQueueDepth=32`）：从 LWIP/AT 路径异步入队帧。
+- **TX 队列**（`tx_queue_`，深度由实例 `Config::tx_queue_depth` 指定，默认 32）：从 LWIP/AT 路径入队固定池槽位指针；池共 `tx_queue_depth + 2` 槽，每槽帧容量 1600 字节。实例 `Config::use_psram=true` 时池及重组工作区使用 PSRAM，否则使用内部 SRAM；默认 `false`，不跨堆回退。
 
 ---
 
@@ -276,7 +276,7 @@ graph TB
 
 1. **初始化**：分配 `rx_buffer_count` 个缓冲区，全部挂载到 GDMA 链表，owner 全部为 DMA。
 2. **接收**：DMA 把数据写入当前节点；遇到 idle EOF 或写满时，将 owner 切到 CPU 并触发 `on_recv_done`。
-3. **回调**：`HandleGdmaRxDone` 在 ISR 中按节点顺序扫描所有 owner=CPU 的缓冲区（idle 模式下可能多块同时完成），同步 cache 后通过 `RxCallback` 派发给上层。
+3. **回调**：`HandleGdmaRxDone` 在 ISR 中按节点顺序扫描 owner=CPU 且尚未交给消费者的缓冲区（idle 模式下可能多块同时完成），同步 cache 后通过 `RxCallback` 派发给上层。
 4. **归还**：`UartEthModem` 在主任务处理完数据后调用 `ReturnBuffer()`，将 owner 写回 DMA 并触发 `gdma_append` 让链表继续运行。
 5. **溢出**：若所有缓冲区都被 CPU 占用，DMA 会触发 `on_descr_err`（`HandleGdmaDescrErr`），设置 `buffer_overflow_` 并暂停 RX。等到所有缓冲区都被归还后，自动 flush UART RX FIFO 并 `RemountAndRestartDma` 恢复。
 
@@ -288,7 +288,7 @@ sequenceDiagram
     participant UHCI as UartUhci
 
     DMA->>ISR: idle EOF (Buffer N owner=CPU)
-    ISR->>ISR: 扫描所有 owner=CPU 的节点
+    ISR->>ISR: 扫描 owner=CPU 且尚未投递的节点
     ISR->>ISR: esp_cache_msync (M2C)
     ISR-->>MAIN: RxCallback → event_queue_(RxData)
 
@@ -478,7 +478,7 @@ sequenceDiagram
     ISR->>EG: kEventSrdyHigh 置位 (TxTask ACK 等待)
 
     HW->>ISR: GDMA RX done
-    ISR->>ISR: 扫描 owner=CPU 节点 + cache 同步
+    ISR->>ISR: 扫描未投递的 owner=CPU 节点 + cache 同步
     ISR->>QUEUE: RxData 事件 (含 buffer 指针)
 
     QUEUE->>TASK: 派发事件
@@ -496,7 +496,7 @@ sequenceDiagram
 ```mermaid
 graph TB
     START[Start(mode)] --> CREATEQ[创建 event_queue_]
-    CREATEQ --> CREATETXQ[创建 tx_queue_<br/>(深度 kTxQueueDepth)]
+    CREATEQ --> CREATETXQ[InitTxPool<br/>按实例配置创建池、完成信号量和 tx_queue_]
     CREATETXQ --> INITUART[InitUart<br/>配置 UART 参数 + 引脚]
     INITUART --> INITGPIO[InitGpio<br/>MRDY 输出 / SRDY 输入 + ISR + 唤醒]
     INITGPIO --> ALLOC[分配 reassembly_buffer_]
@@ -507,7 +507,7 @@ graph TB
     SIGNAL --> RET[Start 返回 ESP_OK<br/>初始化继续异步进行]
 ```
 
-> 失败通过事件回调 (`ErrorInitFailed` / `ErrorNoSim` / `ErrorRegistrationDenied` 等) 上报，调用方收到失败事件后应调用 `Stop()` 释放资源。
+> 失败通过事件回调上报。`ErrorNoSim` 是默认保留 AT 的可恢复状态：Init 任务退出，RX/TX 通道继续工作，`IsAtReady()` 为 true、`IsInitialized()` 为 false，且不创建 netif；接入方可调度查询/切卡命令。通信/初始化故障仍请求停止清理。切卡后通过成功 Stop 再 Start 或板级重启重新联网。
 
 ### 6.2 InitTask 初始化序列（普通模式）
 
@@ -592,9 +592,9 @@ sequenceDiagram
     participant HW as UART/GPIO
 
     APP->>ENQ: 数据
-    ENQ->>ENQ: malloc DMA buffer + 构建 FrameHeader
+    ENQ->>ENQ: 借用固定槽位 + 构建 FrameHeader
     ENQ->>TQ: xQueueSend(TxFrame)
-    note over ENQ: 同步路径(SendFrame)创建 done_sem<br/>异步路径(EnqueueTxFrame)直接返回
+    note over ENQ: 同步路径复用 tx_done_ 等待完成<br/>异步路径直接返回
 
     TX->>TQ: xQueueReceive
     alt 当前 != Active
@@ -613,13 +613,15 @@ sequenceDiagram
     note over TX: 超时仅记录 WARN，仍认为发送完成
 
     TX->>HW: ConfigureSrdyInterrupt(false) (恢复 ANYEDGE)
-    TX->>ENQ: free(frame.data) + (可选) 通知 done_sem
+    TX->>ENQ: 写入槽位结果 + 通知等待者或归还槽位
 ```
 
 要点：
 
 - LWIP 调用 `driver_.transmit` 经 `EnqueueTxFrame`，**不阻塞**，队列满返回 `ESP_ERR_NO_MEM`；
-- AT/握手通过 `SendFrame` 创建 `done_sem`（2s 超时）等待完成；
+- 固定槽位和所有权转换由 `UartEthTxPool` 独立管理；它不持有锁、队列或信号量，驱动在 `tx_mutex_` 内调用池方法。
+- 整个池由带无状态堆删除器的 `std::unique_ptr` 持有，删除器对两种分配配置均适用；初始化失败自动回收，正常停止在任务及等待者退出后释放。队列保存的槽位指针只借用池内存。
+- AT/握手通过 `SendFrame` 串行复用 `tx_done_`（2s 超时）等待完成；超时后工作线程仍持有槽位，完成前不能复用；
 - `TxTask` 优先级略低于 `MainTask`，确保事件循环优先响应；
 - ACK 等待依赖 `event_group_` 的 `kEventSrdyHigh` 位（由 SRDY ISR 置位）。
 
@@ -639,7 +641,7 @@ sequenceDiagram
     DMA->>DMA: 写入当前 owner=DMA 节点
     HW->>DMA: UART idle → EOF
     DMA->>ISR: on_recv_done
-    ISR->>ISR: 扫描 owner=CPU 节点 + esp_cache_msync
+    ISR->>ISR: 扫描未投递的 owner=CPU 节点 + esp_cache_msync
     ISR->>CB: RxCallback (RxBuffer*)
     CB->>MAIN: event_queue_(RxData)
 
@@ -656,7 +658,7 @@ sequenceDiagram
     MAIN->>DMA: ReturnBuffer → owner=DMA + gdma_append
 ```
 
-> 由于 UHCI 在 idle EOF 模式下可能在一次中断里完成多个节点，`HandleGdmaRxDone` 会顺序扫描所有 `owner=CPU` 的节点；上层在一个回调中可能收到多块缓冲区。每个完整帧处理完成后才调用 `SendAckPulse`，避免对未完整帧错误确认。
+> 由于 UHCI 在 idle EOF 模式下可能在一次中断里完成多个节点，`HandleGdmaRxDone` 会顺序扫描 `owner=CPU` 且尚未交给消费者的节点；上层在一个回调中可能收到多块缓冲区。每个完整帧处理完成后才调用 `SendAckPulse`，避免对未完整帧错误确认。
 
 ---
 
@@ -772,10 +774,12 @@ reassembly_size_ == reassembly_expected_ → ProcessReceivedFrame + SendAckPulse
 | **帧过大** | `frame_size > kMaxFrameSize` | 跳过该字节继续扫描，或重置重组状态 |
 | **Slave 无响应** | `PendingActive` 100ms 超时 | 轮询 SRDY，若仍高则强制进入 Active |
 | **TX FIFO 阻塞** | FIFO 满时 `esp_rom_delay_us(10)` 重试 | 透明等待直至写完 |
-| **TX 队列满** | `xQueueSend(tx_queue_, ...)` 失败 | 异步路径返回 `ESP_ERR_NO_MEM`；同步路径阻塞 100ms 后失败 |
+| **TX 队列满** | `xQueueSend(tx_queue_, ...)` 失败 | 异步路径返回 `ESP_ERR_NO_MEM`；同步路径最多重试 100ms 后失败 |
 | **ACK 超时** | `kEventSrdyHigh` 100ms 未置位 | 仅 `ESP_LOGW`，认为发送完成（数据通常已到模组） |
 | **AT 超时** | `kEventAtResponse` 未置位 | `SendAt` 返回 `ESP_ERR_TIMEOUT` |
 | **GDMA 缓冲区耗尽** | `on_descr_err` (`HandleGdmaDescrErr`) | 设置 `buffer_overflow_`，等所有 buffer 归还后 flush UART FIFO 并重启 DMA |
+
+RX 入队失败不丢失归还责任：ISR 调用 `DeferReturnBuffer()`，MainTask 在每轮事件处理前回收；RX 运行时队列等待最多 100 ms，避免最后一次队列失败与出队并发后无人唤醒。该短轮询不改变原有 500 ms 空闲门槛。停止 RX 后排空队列并回收延后归还的缓冲。
 
 ### 10.2 错误恢复流程
 
@@ -786,32 +790,40 @@ graph TB
     TYPE -->|校验失败| DISCARD[丢弃帧 / 重置重组]
     TYPE -->|超时| RETRY[ESP_ERR_TIMEOUT 上报]
     TYPE -->|缓冲区耗尽| OVF[等待全部归还 → 自动重启 DMA]
-    TYPE -->|启动序列失败| STOPF[设置 stop_flag_ + ErrorXxx 事件]
+    TYPE -->|SIM 缺卡或未就绪且 AT 可用| ATONLY[报告 ErrorNoSim；保留 AT / 不建 netif]
+    TYPE -->|通信或其它启动失败| STOPF[RequestStop + ErrorXxx 事件]
 
     DISCARD --> CONTINUE[继续运行]
     RETRY --> CONTINUE
     OVF --> CONTINUE
-    STOPF --> CALLER[调用方负责 Stop()]
+    STOPF --> CALLER[后台清理；调用方 Stop 确认完成]
 ```
 
-### 10.3 资源清理 (`Stop()` → `CleanupResources(true)`)
+### 10.3 有限等待停止与后台资源清理
+
+`Stop(timeout_ms = 5000)` 只发布停止请求并等待 `kEventShutdownComplete`；超时返回 `ESP_ERR_TIMEOUT`，不强制删除任务或释放其资源。调用方保留对象，以 `Stop(0)` 轮询或再次有限等待。清理复用现有 MainTask，不新增 SRAM 任务栈；完成前 Start 被拒绝。析构无法保留自身，因此必须先成功 Stop 再销毁；若违反这一约定且析构中的 Stop 失败，会触发 `ESP_ERROR_CHECK`。
 
 ```mermaid
 graph TB
-    STOP[Stop调用] --> FLAG[stop_flag_ = true]
-    FLAG --> NUDGE[向 event_queue_ / tx_queue_<br/>各送一个唤醒事件]
-    NUDGE --> WAIT[等 kEventAllTasksDone (10s)]
-    WAIT --> CLEAN[CleanupResources]
-
-    CLEAN --> ETH[DeinitIotEth<br/>(注销 IP handler / glue / netif / iot_eth)]
-    ETH --> UHCI[uart_uhci_.Deinit<br/>(StopReceive + 释放 GDMA / PM 锁)]
-    UHCI --> RBUF[释放 reassembly_buffer_]
-    RBUF --> TQ[排空并删除 tx_queue_]
-    TQ --> EQ[排空并删除 event_queue_]
-    EQ --> GPIO[DeinitGpio<br/>(禁用唤醒 / 移除 ISR / 复位引脚)]
-    GPIO --> UART[DeinitUart<br/>(断开引脚 / 复位 GPIO)]
-    UART --> DONE[完成 → initialized_=false]
+    STOP[Stop调用] --> FLAG[置停止标志和事件位]
+    FLAG --> NUDGE[唤醒 RX/TX 队列<br/>发布 StopPublished]
+    NUDGE --> WAIT[有限等待 ShutdownComplete]
+    WAIT -->|到期| TIMEOUT[返回 TIMEOUT；持有者保留对象稍后重试]
+    WAIT -->|完成| OK[返回 OK；可销毁或重启]
+    FLAG --> MAIN[MainTask 停 RX 并归还全部 RX 缓冲]
+    MAIN --> JOIN[等 TX/Init 退出及 StopPublished]
+    JOIN --> LOCK[等待激活互斥锁]
+    LOCK --> ETH[DeinitIotEth]
+    ETH --> GPIO[移除 GPIO ISR / 禁用唤醒]
+    GPIO --> UHCI[Deinit UHCI / 释放重组缓冲]
+    UHCI --> TQ[等待同步调用者退出<br/>释放 TX 池、信号量和队列]
+    TQ --> EQ[删除事件队列 / DeinitUart]
+    EQ --> DONE[置 ShutdownComplete]
 ```
+
+TX 退出前先与入队者同步，再取消排队帧并唤醒同步等待者。所有等待 Stop 位的路径均不消费该位，下一次 Start 才统一清除。MainTask 等待 `StopPublished`，确保停止请求发布者不会在队列已销毁后继续发送唤醒事件。
+
+`PrepareForShutdown(timeout_ms = 3000)` 是板级 CFUN/RF 优雅退出之前的独立激活屏障，锁等待有时限；超时仍阻止新激活。Stop 无须等待该屏障才能发出取消，激活锁的等待发生在后台。CFUN/RF 命令本身的时间不包含在 Stop 预算中。FIFO 发送有 1000 ms 总期限和停止取消标志，超时/取消会清空残留 TX FIFO、释放 PM 锁。
 
 ---
 
@@ -833,11 +845,12 @@ static constexpr int64_t kAckPulseUs      = 50;   // MRDY 高电平 ACK 脉冲
 static constexpr uint32_t kHandshakeTimeoutMs = 5000; // 握手 ACK 等待
 static constexpr uint32_t kModemSleepTimeoutS = 3;    // AT+ECSCLKEX=1,3,30
 
-// TX 队列
-static constexpr size_t kTxQueueDepth = 32;       // 最多堆积的待发帧
+// TX 队列和 CPU 缓冲的实例配置（默认值）
+Config::tx_queue_depth = 32;                    // 池另加两个槽位
+Config::use_psram = false;                      // true 使用 PSRAM，不跨堆回退
 
 // UART
-Config::baud_rate = 3000000; // 3 Mbps (启动时会自动尝试 2M/3M 兜底)
+Config::baud_rate = 3000000; // 每次探测先显式设置调用者配置的速率，在 5 秒窗口内重试 AT，成功立即返回，超时后按 2M/3M 兜底
 data_bits = 8; parity = none; stop_bits = 1; flow_ctrl = disable;
 ```
 
@@ -851,11 +864,12 @@ data_bits = 8; parity = none; stop_bits = 1; flow_ctrl = disable;
 |------|---------|------|
 | **AT 命令调用** | `at_mutex_` (std::mutex) | 串行化 `SendAt` 调用 |
 | **AT 响应通知** | `event_group_` 中 `kEventAtResponse` | `HandleAtResponse` 收到 OK/ERROR 时置位 |
-| **同步发送完成** | `TxFrame::done_sem` (二进制信号量) | `SendFrame` 等待 `TxTask` 完成 |
+| **同步发送完成** | 预创建的 `tx_done_` + `at_mutex_` | 同步等待串行化，超时不会销毁通知对象 |
+| **TX 槽位所有权** | `tx_mutex_` | 保护独立 `UartEthTxPool` 的 worker / waiter / completed / result；两方均释放后才复用 |
 | **状态/标志位** | `std::atomic<T>` | `working_state_` / `stop_flag_` / `seq_no_` 等 |
 | **状态机/任务事件** | `event_group_` | 启动、握手、网络就绪、停止、SRDY High 等 |
 | **事件传递** | `event_queue_` (FreeRTOS Queue, ISR safe, 深度 32) | ISR / 任务 → MainTask |
-| **TX 入队** | `tx_queue_` (FreeRTOS Queue, 深度 `kTxQueueDepth`) | LWIP/AT → TxTask |
+| **TX 入队** | `tx_queue_` (FreeRTOS Queue, 深度 `Config::tx_queue_depth`) | LWIP/AT → TxTask |
 
 > 已经移除：旧版的 `send_mutex_` 与独立的 AT 响应信号量。当前 AT 响应统一使用 event group，发送串行化由 `TxTask` + 队列保证。
 
@@ -884,7 +898,7 @@ graph TB
     QUEUE --> MAIN
 
     LWIP -->|EnqueueTxFrame| TQ[tx_queue_]
-    APIS -->|SendFrame + done_sem| TQ
+    APIS -->|SendFrame + tx_done_| TQ
     TQ --> TX
     TX -->|TxRequest| QUEUE
     MAIN -. kEventActiveState .-> TX

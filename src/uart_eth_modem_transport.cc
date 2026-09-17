@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "uart_eth_modem.h"
+#include "uart_eth_memory.h"
+
+#include <new>
+#include <limits>
+#include <utility>
 
 #include <chrono>
 #include <cstdio>
@@ -24,21 +29,12 @@ void UartEthModem::TxTaskRun() {
     ESP_LOGD(kTag, "TX task started");
 
     while (!stop_flag_.load()) {
-        TxFrame frame;
+        TxFrame* frame = nullptr;
         // Wait for frame in queue (blocks here, not in LWIP context)
         if (xQueueReceive(tx_queue_, &frame, portMAX_DELAY) == pdTRUE) {
+            if (!frame) continue;  // Stop wakeup sentinel
             if (stop_flag_.load()) {
-                // Cleanup frame if stopping
-                if (frame.data) {
-                    free(frame.data);
-                }
-                // Notify waiter if any
-                if (frame.done_sem) {
-                    if (frame.result) {
-                        *frame.result = ESP_ERR_INVALID_STATE;
-                    }
-                    xSemaphoreGive(frame.done_sem);
-                }
+                CompleteTxFrame(frame, ESP_ERR_INVALID_STATE);
                 break;
             }
 
@@ -80,7 +76,7 @@ void UartEthModem::TxTaskRun() {
             xEventGroupClearBits(event_group_, kEventSrdyHigh);
 
             // Transmit via UHCI (Synchronous FIFO mode)
-            ret = uart_uhci_.Transmit(frame.data, frame.length);
+            ret = uart_uhci_.Transmit(frame->data, frame->length, 1000, &stop_flag_);
             if (ret != ESP_OK) {
                 ESP_LOGE(kTag, "TX task: UHCI transmit failed: %s", esp_err_to_name(ret));
                 goto done;
@@ -91,7 +87,7 @@ void UartEthModem::TxTaskRun() {
                 EventBits_t bits = xEventGroupWaitBits(
                     event_group_,
                     kEventSrdyHigh | kEventStop,
-                    pdTRUE,   // clear on exit
+                    pdFALSE,  // Stop remains latched; ACK is cleared before TX
                     pdFALSE,  // wait for any bit
                     pdMS_TO_TICKS(kAckTimeoutMs)
                 );
@@ -106,23 +102,23 @@ void UartEthModem::TxTaskRun() {
                     ESP_LOGW(kTag, "TX task: ACK timeout in %ld us", (long)(esp_timer_get_time() - last_activity_time_us_));
                 } else if (debug_enabled_.load()) {
                     ESP_LOGI(kTag, "TX task: frame sent, %d bytes, acked in %ld us", 
-                             frame.length, (long)(esp_timer_get_time() - last_activity_time_us_));
+                             frame->length, (long)(esp_timer_get_time() - last_activity_time_us_));
                 }
             }
 
 done:
             ConfigureSrdyInterrupt(kSrdyInterruptForAck);
-            // Cleanup and notify
-            free(frame.data);
-            if (frame.done_sem) {
-                if (frame.result) {
-                    *frame.result = ret;
-                }
-                xSemaphoreGive(frame.done_sem);
-            }
+            CompleteTxFrame(frame, ret);
         }
     }
 
+    // Join an enqueue that passed admission before cancellation was latched.
+    { std::lock_guard<std::mutex> lock(tx_mutex_); }
+    // Cancel queued work before publishing done so AT/init waiters wake now.
+    TxFrame* pending = nullptr;
+    while (xQueueReceive(tx_queue_, &pending, 0) == pdTRUE) {
+        if (pending) CompleteTxFrame(pending, ESP_ERR_INVALID_STATE);
+    }
     ESP_LOGD(kTag, "TX task exiting");
     xEventGroupSetBits(event_group_, kEventTxTaskDone);
 }
@@ -137,7 +133,13 @@ void UartEthModem::MainTaskRun() {
 
     while (!stop_flag_.load()) {
         // Calculate next timeout based on current state
+        uart_uhci_.ReclaimDeferredBuffers();
         TickType_t wait_ticks = CalculateNextTimeout();
+        // A queue-full ISR may race the final dequeue. Bound the next wait
+        // while RX is running so its deferred return never needs another event.
+        if (uart_uhci_.IsReceiving() && wait_ticks > pdMS_TO_TICKS(100)) {
+            wait_ticks = pdMS_TO_TICKS(100);
+        }
 
         Event event;
         if (xQueueReceive(event_queue_, &event, wait_ticks) == pdTRUE) {
@@ -153,8 +155,24 @@ void UartEthModem::MainTaskRun() {
         EnterIdleState();
     }
 
-    ESP_LOGD(kTag, "Main task exiting");
-    xEventGroupSetBits(event_group_, kEventMainTaskDone);
+    // StopReceive has joined the RX callbacks; drain all leases before Deinit.
+    uart_uhci_.StopReceive();
+    Event pending;
+    while (xQueueReceive(event_queue_, &pending, 0) == pdTRUE) {
+        if (pending.type == EventType::RxData) uart_uhci_.ReturnBuffer(pending.rx_buffer);
+    }
+    uart_uhci_.ReclaimDeferredBuffers();
+
+    // Reuse this existing task as the cleanup coordinator: no extra SRAM stack.
+    // Never destroy queues until RequestStop has finished publishing wakeups.
+    xEventGroupWaitBits(event_group_, kEventTxTaskDone | kEventInitTaskDone | kEventStopPublished,
+                       pdFALSE, pdTRUE, portMAX_DELAY);
+    {
+        std::lock_guard<std::timed_mutex> activation_lock(data_activation_mutex_);
+        CleanupResources(true);
+    }
+    ESP_LOGD(kTag, "Main task cleanup complete");
+    xEventGroupSetBits(event_group_, kEventMainTaskDone | kEventShutdownComplete);
 }
 
 // UHCI RX callback static wrapper (called from ISR context)
@@ -168,7 +186,9 @@ bool IRAM_ATTR UartEthModem::UhciRxCallbackStatic(const UartUhci::RxEventData& d
         .rx_buffer = data.buffer,
     };
 
-    xQueueSendFromISR(self->event_queue_, &event, &xHigherPriorityTaskWoken);
+    if (xQueueSendFromISR(self->event_queue_, &event, &xHigherPriorityTaskWoken) != pdTRUE) {
+        self->uart_uhci_.DeferReturnBuffer(data.buffer);
+    }
 
     return xHigherPriorityTaskWoken == pdTRUE;
 }
@@ -265,7 +285,7 @@ void UartEthModem::HandleEvent(const Event& event) {
             break;
 
         case EventType::Stop:
-            stop_flag_.store(true);
+            // RequestStop already latched cancellation before sending wakeup.
             break;
 
         default:
@@ -282,10 +302,8 @@ void UartEthModem::HandleRxData(UartUhci::RxBuffer* buffer) {
         return;
     }
 
-    // Ensure we're in active state
-    if (working_state_.load() != WorkingState::Active) {
-        EnterActiveState();
-    }
+    // A queued frame may outlive StopReceive. Process and return it before
+    // attempting to remount the RX ring.
 
     // Update activity time
     last_activity_time_us_ = esp_timer_get_time();
@@ -406,8 +424,11 @@ void UartEthModem::HandleRxData(UartUhci::RxBuffer* buffer) {
         }
     }
 
-    // Return buffer to pool
+    // Return buffer to pool before restarting a stopped ring.
     uart_uhci_.ReturnBuffer(buffer);
+    if (!stop_flag_.load() && working_state_.load() != WorkingState::Active) {
+        EnterActiveState();
+    }
 }
 
 // Handle SRDY low event: Slave wants to send data or is ready to receive
@@ -461,6 +482,8 @@ void UartEthModem::HandleIdleTimeout() {
             EnterActiveState();
         }
     } else if (state == WorkingState::Active) {
+        // A short wakeup may only be for deferred RX recycling.
+        if (esp_timer_get_time() - last_activity_time_us_ < kIdleTimeoutMs * 1000) return;
         // Timeout in active state, enter pending idle
         if (debug_enabled_.load()) {
             ESP_LOGI(kTag, "Idle timeout, entering pending idle state");
@@ -527,7 +550,12 @@ void UartEthModem::EnterActiveState() {
     if (!uart_uhci_.IsReceiving()) {
         esp_err_t ret = uart_uhci_.StartReceive();
         if (ret != ESP_OK) {
-            ESP_LOGE(kTag, "Failed to start UHCI receive: %s", esp_err_to_name(ret));
+            // Older RX events still own buffers. Their final return will
+            // retry this transition; do not advertise Active before DMA starts.
+            ESP_LOGD(kTag, "UHCI receive waiting for buffers: %s", esp_err_to_name(ret));
+            SetMrdy(MrdyLevel::Low);
+            working_state_.store(WorkingState::PendingActive);
+            return;
         }
     }
 
@@ -577,109 +605,131 @@ void UartEthModem::EnterIdleState() {
     ConfigureSrdyInterrupt(kSrdyInterruptForWakeup);
 }
 
-// Enqueue TX frame for non-blocking transmission
-esp_err_t UartEthModem::EnqueueTxFrame(const uint8_t* buf, size_t len) {
-    // Allocate frame with header (DMA compatible memory)
-    size_t total_len = sizeof(FrameHeader) + len;
-    uint8_t* buffer = static_cast<uint8_t*>(heap_caps_malloc(total_len, MALLOC_CAP_DMA));
-    if (!buffer) {
-        ESP_LOGE(kTag, "Failed to allocate TX buffer for queue");
+void UartEthModem::TxPoolDeleter::operator()(UartEthTxPool* pool) const noexcept {
+    pool->~UartEthTxPool();
+    heap_caps_free(pool);
+}
+
+// All TX payloads are CPU-read by Transmit's FIFO writer, never DMA-read.
+// The selected heap is strict: allocation failure never switches heaps.
+esp_err_t UartEthModem::InitTxPool() {
+    // Materialize the reusable pool mutex during initialization, not first send.
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    // Queue + active TX + completed synchronous frame awaiting its waiter.
+    constexpr size_t max_slots = (SIZE_MAX - sizeof(UartEthTxPool)) / sizeof(TxFrame);
+    if (config_.tx_queue_depth == 0 || config_.tx_queue_depth > max_slots - 2 ||
+        config_.tx_queue_depth > std::numeric_limits<UBaseType_t>::max()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t slots = config_.tx_queue_depth + 2;
+    void* storage = uart_eth::memory::AllocateBuffer(
+        sizeof(UartEthTxPool) + slots * sizeof(TxFrame), config_.use_psram);
+    if (!storage) return ESP_ERR_NO_MEM;
+    // One allocation contains both the pool metadata and its variable-size array.
+    static_assert(sizeof(UartEthTxPool) % alignof(TxFrame) == 0);
+    auto* frames = new (static_cast<uint8_t*>(storage) + sizeof(UartEthTxPool)) TxFrame[slots]{};
+    TxPoolPtr pool{new (storage) UartEthTxPool{std::span{frames, slots}}};
+    tx_done_ = xSemaphoreCreateBinary();
+    if (!tx_done_) return ESP_ERR_NO_MEM;
+    tx_queue_ = xQueueCreate(config_.tx_queue_depth, sizeof(TxFrame*));
+    if (!tx_queue_) {
+        vSemaphoreDelete(tx_done_);
+        tx_done_ = nullptr;
         return ESP_ERR_NO_MEM;
     }
-
-    // Build header
-    FrameHeader* header = reinterpret_cast<FrameHeader*>(buffer);
-    *reinterpret_cast<uint32_t*>(header->raw) = 0;
-    header->SetPayloadLength(len);
-    header->SetSequence(seq_no_++);
-    header->SetFlowControl(false);  // XON = 0 (permit to send)
-    header->SetType(FrameType::kEthernet);
-    header->UpdateChecksum();
-
-    // Copy payload
-    memcpy(buffer + sizeof(FrameHeader), buf, len);
-
-    // Enqueue frame (non-blocking, no completion notification)
-    TxFrame frame = {
-        .data = buffer, 
-        .length = total_len,
-        .done_sem = nullptr,
-        .result = nullptr
-    };
-    if (xQueueSend(tx_queue_, &frame, 0) != pdTRUE) {
-        ESP_LOGW(kTag, "TX queue full, dropping frame");
-        free(buffer);
-        return ESP_ERR_NO_MEM;  // Queue full
-    }
-
+    tx_pool_ = std::move(pool);
     return ESP_OK;
 }
 
-// Send frame (public interface): enqueue and wait for completion
-// All transmission goes through TxTaskRun to avoid resource contention.
-esp_err_t UartEthModem::SendFrame(const uint8_t* data, size_t length, FrameType type) {
-    // Allocate frame with header (DMA compatible memory)
-    size_t total_len = sizeof(FrameHeader) + length;
-    uint8_t* buffer = static_cast<uint8_t*>(heap_caps_malloc(total_len, MALLOC_CAP_DMA));
-    if (!buffer) {
-        ESP_LOGE(kTag, "Failed to allocate TX buffer");
-        return ESP_ERR_NO_MEM;
+void UartEthModem::DeinitTxPool() {
+    // Workers are joined and admission is closed before this function runs.
+    // Finish queued frames too, waking any synchronous waiter with cancellation.
+    TxFrame* frame = nullptr;
+    while (tx_queue_ && xQueueReceive(tx_queue_, &frame, 0) == pdTRUE) {
+        if (frame) CompleteTxFrame(frame, ESP_ERR_INVALID_STATE);
     }
-
-    // Build header
-    FrameHeader* header = reinterpret_cast<FrameHeader*>(buffer);
-    *reinterpret_cast<uint32_t*>(header->raw) = 0;
-    header->SetPayloadLength(length);
-    header->SetSequence(seq_no_++);
-    header->SetFlowControl(false);  // XON = 0 (permit to send), XOFF = 1 (shall not send)
-    header->SetType(type);
-    header->UpdateChecksum();
-
-    // Copy payload
-    memcpy(buffer + sizeof(FrameHeader), data, length);
-
-    // Create binary semaphore for synchronous wait
-    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
-    if (!done_sem) {
-        ESP_LOGE(kTag, "Failed to create semaphore");
-        free(buffer);
-        return ESP_ERR_NO_MEM;
+    // Join the waiter before deleting its shared semaphore or PSRAM slot.
+    std::lock_guard<std::timed_mutex> wait_lock(at_mutex_);
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    if (tx_done_) {
+        vSemaphoreDelete(tx_done_);
+        tx_done_ = nullptr;
     }
-
-    // Prepare frame with completion notification
-    esp_err_t result = ESP_OK;
-    TxFrame frame = {
-        .data = buffer,
-        .length = total_len,
-        .done_sem = done_sem,
-        .result = &result
-    };
-
-    // Enqueue frame (block for a short time if queue is full)
-    if (xQueueSend(tx_queue_, &frame, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(kTag, "TX queue full, cannot send frame");
-        vSemaphoreDelete(done_sem);
-        free(buffer);
-        return ESP_ERR_NO_MEM;
+    tx_pool_.reset();
+    if (tx_queue_) {
+        vQueueDelete(tx_queue_);
+        tx_queue_ = nullptr;
     }
-
-    // Wait for transmission to complete (with timeout)
-    // We wait long enough for TxTaskRun to finish its own internal timeouts (up to 1s for TX, 200ms for active state)
-    if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(kTag, "SendFrame timeout waiting for completion");
-        // WARNING: If we delete the semaphore here, TxTaskRun might still try to use it later,
-        // causing a crash. However, after 2 seconds, it's very likely TxTaskRun has already
-        // finished or timed out itself.
-        vSemaphoreDelete(done_sem);
-        // Note: buffer is freed by TxTaskRun, don't free here
-        return ESP_ERR_TIMEOUT;
-    }
-
-    vSemaphoreDelete(done_sem);
-    return result;
 }
 
-// Process frame data received via DMA
+esp_err_t UartEthModem::QueueTxFrame(const uint8_t* data, size_t length,
+                                    FrameType type, bool synchronous,
+                                    TxFrame** queued_frame) {
+    if (!data || length == 0) return ESP_ERR_INVALID_ARG;
+    if (length > sizeof(TxFrame::data) - sizeof(FrameHeader)) return ESP_ERR_INVALID_SIZE;
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    if (stop_flag_.load() || !tx_pool_ || !tx_queue_) return ESP_ERR_INVALID_STATE;
+    TxFrame* frame = tx_pool_->Acquire(sizeof(FrameHeader) + length, synchronous);
+    if (!frame) return ESP_ERR_NO_MEM;
+    FrameHeader header{};
+    header.SetPayloadLength(length);
+    header.SetSequence(seq_no_++);
+    header.SetFlowControl(false);
+    header.SetType(type);
+    header.UpdateChecksum();
+    memcpy(frame->data, &header, sizeof(header));
+    memcpy(frame->data + sizeof(header), data, length);
+    if (xQueueSend(tx_queue_, &frame, 0) != pdTRUE) {
+        tx_pool_->Complete(*frame, ESP_ERR_NO_MEM);
+        tx_pool_->ReleaseWaiter(*frame);
+        return ESP_ERR_NO_MEM;
+    }
+    if (queued_frame) *queued_frame = frame;
+    return ESP_OK;
+}
+
+void UartEthModem::CompleteTxFrame(TxFrame* frame, esp_err_t result) {
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    tx_pool_->Complete(*frame, result);
+    if (frame->waiter) {
+        // Give under the same lock used to detach a timed-out waiter. No give
+        // can arrive after that slot has been released or reused.
+        xSemaphoreGive(tx_done_);
+    }
+}
+
+esp_err_t UartEthModem::EnqueueTxFrame(const uint8_t* buf, size_t len) {
+    return QueueTxFrame(buf, len, FrameType::kEthernet, false, nullptr);
+}
+
+esp_err_t UartEthModem::SendFrame(const uint8_t* data, size_t length, FrameType type) {
+    // SendAt and the handshake caller both hold at_mutex_, so one reusable
+    // completion semaphore is sufficient without another waiter mutex.
+    {
+        std::lock_guard<std::mutex> lock(tx_mutex_);
+        if (stop_flag_.load() || !tx_done_) return ESP_ERR_INVALID_STATE;
+        xSemaphoreTake(tx_done_, 0);  // Drain a completion racing the last timeout.
+    }
+    TxFrame* frame = nullptr;
+    const TickType_t start = xTaskGetTickCount();
+    esp_err_t ret;
+    do {
+        ret = QueueTxFrame(data, length, type, true, &frame);
+        if (ret != ESP_ERR_NO_MEM) break;
+        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(100)) return ret;
+        vTaskDelay(1);
+    } while (true);
+    if (ret != ESP_OK) return ret;
+
+    xSemaphoreTake(tx_done_, pdMS_TO_TICKS(2000));
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    // Completion may win just after the timed wait expires; trust slot state.
+    ret = frame->completed ? frame->result : ESP_ERR_TIMEOUT;
+    tx_pool_->ReleaseWaiter(*frame);
+    // Otherwise the worker still owns the slot and releases it on completion.
+    return ret;
+}
+
 void UartEthModem::ProcessReceivedFrame(uint8_t* data, size_t size) {
     if (size < sizeof(FrameHeader)) {
         if (debug_enabled_.load() && size > 0) {
@@ -751,4 +801,3 @@ void UartEthModem::HandleEthFrame(uint8_t* data, size_t length) {
         free(data);
     }
 }
-
